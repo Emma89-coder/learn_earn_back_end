@@ -1,0 +1,55 @@
+1. What is the capital of France?
+A. London
+B. Paris
+C. Berlin
+D. Madrid
+Answer: B
+
+2. What is 2+2?
+A. 3
+B. 4
+C. 5
+D. 6
+Answer: B
+
+3. Which planet is closest to the Sun?
+A. Venus
+B. Mercury
+C. Earth
+D. Mars
+Answer: B
+
+4. What is the chemical symbol for Gold?
+A. Go
+B. Gd
+C. Au
+D. Ag
+Answer: C
+
+5. Who wrote Romeo and Juliet?
+A. Charles Dickens
+B. Jane Austen
+C. William Shakespeare
+D. Mark Twain
+Answer: C
+
+6. What is the largest ocean on Earth?
+A. Atlantic Ocean
+B. Indian Ocean
+C. Arctic Ocean
+D. Pacific Ocean
+Answer: D
+
+7. What year did World War II end?
+A. 1943
+B. 1944
+C. 1945
+D. 1946
+Answer: C
+
+8. Which country has the most population?
+A. India
+B. United States
+C. Indonesia
+D. Brazil
+Answer: A

@@ -1,0 +1,116 @@
+==========================================
+QUIZ IMPORT FILE FORMAT GUIDE
+==========================================
+
+SUPPORTED FORMATS: PDF and CSV
+
+==========================================
+CSV FORMAT (RECOMMENDED - EASIEST)
+==========================================
+
+File: quiz_questions.csv
+Encoding: UTF-8
+
+Format: question,optionA,optionB,optionC,optionD,correctAnswer
+
+Example:
+-------
+question,optionA,optionB,optionC,optionD,correctAnswer
+"What is the capital of France?","London","Paris","Berlin","Madrid","Paris"
+"What is 2+2?","3","4","5","6","4"
+"Which planet is closest to the Sun?","Venus","Mercury","Earth","Mars","Mercury"
+"What is the chemical symbol for Gold?","Go","Gd","Au","Ag","Au"
+
+Notes:
+- First row must be the header
+- Enclose questions and options in quotes if they contain commas
+- Correct answer must EXACTLY match one of the options
+- Each row = 1 question
+
+==========================================
+PDF FORMAT
+==========================================
+
+File: quiz_questions.pdf
+
+Format Options:
+
+OPTION 1 - Standard Numbering:
+1. What is the capital of France?
+A. London
+B. Paris
+C. Berlin
+D. Madrid
+Answer: B
+
+OPTION 2 - Question prefix:
+Q1. What is the capital of France?
+A. London
+B. Paris
+C. Berlin
+D. Madrid
+Correct Answer: B
+
+OPTION 3 - Parentheses:
+1) What is the capital of France?
+A) London
+B) Paris
+C) Berlin
+D) Madrid
+Answer: B
+
+ANSWER FORMATS (any of these work):
+- Answer: B
+- Correct Answer: A
+- Correct: C
+- Right Answer: D
+- Ans: A
+- *B* (asterisks around letter)
+- **C** (double asterisks)
+
+COMPLETE PDF EXAMPLE:
+---
+1. What is the capital of France?
+A. London
+B. Paris
+C. Berlin
+D. Madrid
+Answer: B
+
+2. What is 2+2?
+A. 3
+B. 4
+C. 5
+D. 6
+Correct Answer: B
+
+3. Which planet is closest to the Sun?
+A. Venus
+B. Mercury
+C. Earth
+D. Mars
+Answer: B
+
+==========================================
+TROUBLESHOOTING
+==========================================
+
+Problem: "No questions could be extracted"
+Solution: 
+- Check file format matches examples above
+- Ensure questions have all 4 options (A, B, C, D)
+- Verify correct answer line is present
+- Use CSV format if PDF issues persist
+
+Problem: "Questions extracted but answers wrong"
+Solution:
+- Verify correct answer EXACTLY matches option text
+- Check for extra spaces in options
+
+Problem: "Only some questions extracted"
+Solution:
+- Some questions may be malformed
+- Remove questions with missing options or answers
+- Reformat and try again
+
+==========================================
