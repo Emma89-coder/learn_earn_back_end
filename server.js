@@ -1,4 +1,6 @@
-require('dotenv').config();
+const path = require('path');
+require('dotenv').config({ path: path.join(__dirname, '.env') });
+const JWT_SECRET = process.env.JWT_SECRET || 'dev_jwt_secret_change_me';
 const express = require('express');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
@@ -9,7 +11,6 @@ const fs = require('fs');
 const csv = require('csv-parser');
 const { S3Client, PutObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
 const { v4: uuidv4 } = require('uuid');
-const path = require('path');
 
 // ============ FIXED PDF PARSER IMPORT ============
 let pdfParse;
@@ -22,7 +23,12 @@ try {
   pdfParse = null;
 }
 
+// ============ INITIALIZE EXPRESS APP ============
 const app = express();
+
+// ============ AI ROUTES ============
+const aiRoutes = require('./routes/admin/ai');
+app.use('/api/ai', aiRoutes);
 
 // ============ ENHANCED CORS ============
 app.use(cors({
@@ -41,11 +47,8 @@ app.use((req, res, next) => {
   next();
 });
 
-// Supabase Client
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
-);
+// Supabase Client (initialized at startup after DNS check)
+let supabase;
 
 // ============ CLOUDFLARE R2 CONFIGURATION ============
 const r2Client = new S3Client({
@@ -56,6 +59,41 @@ const r2Client = new S3Client({
     secretAccessKey: process.env.CLOUDFLARE_SECRET_ACCESS_KEY,
   },
 });
+
+// ============ CLOUDFLARE R2 HELPER FUNCTIONS ============
+const uploadToR2 = async (buffer, fileName, mimeType) => {
+  try {
+    const command = new PutObjectCommand({
+      Bucket: process.env.CLOUDFLARE_R2_BUCKET,
+      Key: fileName,
+      Body: buffer,
+      ContentType: mimeType,
+      CacheControl: 'public, max-age=31536000',
+    });
+
+    await r2Client.send(command);
+    const url = `${process.env.CLOUDFLARE_PUBLIC_URL}/${fileName}`;
+    return { success: true, url };
+  } catch (error) {
+    console.error('Error uploading to R2:', error);
+    return { success: false, error: error.message };
+  }
+};
+
+const deleteFromR2 = async (fileName) => {
+  try {
+    const command = new DeleteObjectCommand({
+      Bucket: process.env.CLOUDFLARE_R2_BUCKET,
+      Key: fileName,
+    });
+
+    await r2Client.send(command);
+    return { success: true };
+  } catch (error) {
+    console.error('Error deleting from R2:', error);
+    return { success: false, error: error.message };
+  }
+};
 
 // Configure multer for memory storage
 const storage = multer.memoryStorage();
@@ -83,7 +121,7 @@ const authenticateToken = (req, res, next) => {
     return res.status(401).json({ error: 'Access token required' });
   }
 
-  jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
+  jwt.verify(token, JWT_SECRET, (err, user) => {
     if (err) return res.status(403).json({ error: 'Invalid token' });
     req.user = user;
     next();
@@ -91,11 +129,381 @@ const authenticateToken = (req, res, next) => {
 };
 
 const requireAdmin = (req, res, next) => {
-  if (req.user.role !== 'admin') {
+  const role = String(req.user?.role || '').toLowerCase();
+  if (!role || !role.includes('admin')) {
     return res.status(403).json({ error: 'Admin access required' });
   }
   next();
 };
+
+// ============ REWARDS ENDPOINTS ============
+
+// Get all rewards
+app.get('/api/admin/rewards', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { data: rewards, error } = await supabase
+      .from('rewards')
+      .select('*')
+      .order('created_at', { ascending: false });
+
+    if (error) {
+      console.error('Error fetching rewards:', error);
+      return res.status(400).json({ success: false, error: error.message });
+    }
+
+    res.json({ success: true, rewards: rewards || [] });
+  } catch (error) {
+    console.error('Get rewards error:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch rewards' });
+  }
+});
+
+// Create a new reward
+app.post('/api/admin/create-reward', authenticateToken, requireAdmin, async (req, res) => {
+  console.log('📝 Creating new reward:', req.body);
+  
+  try {
+    const { name, description, points_required, stock_quantity, image_url, is_active } = req.body;
+
+    if (!name || !name.trim()) {
+      return res.status(400).json({ success: false, error: 'Reward name is required' });
+    }
+
+    if (!points_required || points_required <= 0) {
+      return res.status(400).json({ success: false, error: 'Points required must be greater than 0' });
+    }
+
+    const newReward = {
+      name: name.trim(),
+      description: description?.trim() || '',
+      points_required: parseInt(points_required),
+      stock_quantity: parseInt(stock_quantity) || 0,
+      image_url: image_url || null,
+      is_active: is_active !== false,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    };
+
+    console.log('Inserting reward with data:', newReward);
+
+    const { data, error } = await supabase
+      .from('rewards')
+      .insert([newReward])
+      .select()
+      .single();
+
+    if (error) {
+      console.error('Supabase insert error:', error);
+      return res.status(400).json({ success: false, error: error.message });
+    }
+
+    console.log('✅ Reward created successfully:', data.id);
+    res.json({ success: true, reward: data, message: 'Reward created successfully' });
+  } catch (error) {
+    console.error('Create reward error:', error);
+    res.status(500).json({ success: false, error: 'Failed to create reward' });
+  }
+});
+
+// Update a reward
+
+app.post('/api/admin/update-reward/:id', authenticateToken, requireAdmin, async (req, res) => {
+  console.log('✏️ Updating reward:', req.params.id, req.body);
+  
+  try {
+    const { id } = req.params;
+    const { name, description, points_required, stock_quantity, image_url, is_active } = req.body;
+
+    // Check if reward exists
+    const { data: existingReward, error: fetchError } = await supabase
+      .from('rewards')
+      .select('id')
+      .eq('id', id)
+      .single();
+
+    if (fetchError || !existingReward) {
+      return res.status(404).json({ success: false, error: 'Reward not found' });
+    }
+
+    const updates = {
+      name: name?.trim(),
+      description: description?.trim() || '',
+      points_required: parseInt(points_required),
+      stock_quantity: parseInt(stock_quantity) || 0,
+      image_url: image_url || null,
+      is_active: is_active !== false,
+      updated_at: new Date().toISOString()
+    };
+
+    // Remove undefined fields
+    Object.keys(updates).forEach(key => updates[key] === undefined && delete updates[key]);
+
+    console.log('Updating reward with data:', updates);
+
+    const { data, error } = await supabase
+      .from('rewards')
+      .update(updates)
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (error) {
+      console.error('Supabase update error:', error);
+      return res.status(400).json({ success: false, error: error.message });
+    }
+
+    console.log('✅ Reward updated successfully:', data.id);
+    res.json({ success: true, reward: data, message: 'Reward updated successfully' });
+  } catch (error) {
+    console.error('Update reward error:', error);
+    res.status(500).json({ success: false, error: 'Failed to update reward' });
+  }
+});
+
+// Delete a reward
+app.delete('/api/admin/delete-reward/:id', authenticateToken, requireAdmin, async (req, res) => {
+  console.log('🗑️ Deleting reward:', req.params.id);
+  
+  try {
+    const { id } = req.params;
+
+    // Check if reward exists
+    const { data: existingReward, error: fetchError } = await supabase
+      .from('rewards')
+      .select('id, image_url')
+      .eq('id', id)
+      .single();
+
+    if (fetchError || !existingReward) {
+      return res.status(404).json({ success: false, error: 'Reward not found' });
+    }
+
+    // Delete image from R2 if exists
+    if (existingReward.image_url) {
+      try {
+        const fileKey = existingReward.image_url.split('/').slice(-2).join('/');
+        await deleteFromR2(fileKey);
+        console.log('✅ Deleted image from R2');
+      } catch (deleteError) {
+        console.error('Error deleting image from R2:', deleteError);
+        // Continue with reward deletion even if image deletion fails
+      }
+    }
+
+    const { error } = await supabase
+      .from('rewards')
+      .delete()
+      .eq('id', id);
+
+    if (error) {
+      console.error('Supabase delete error:', error);
+      return res.status(400).json({ success: false, error: error.message });
+    }
+
+    console.log('✅ Reward deleted successfully:', id);
+    res.json({ success: true, message: 'Reward deleted successfully' });
+  } catch (error) {
+    console.error('Delete reward error:', error);
+    res.status(500).json({ success: false, error: 'Failed to delete reward' });
+  }
+});
+
+// ============ LEARNER REWARDS ENDPOINTS ============
+
+// Get available rewards for learners (no admin required)
+app.get('/api/learner/rewards', authenticateToken, async (req, res) => {
+  try {
+    const { data: rewards, error } = await supabase
+      .from('rewards')
+      .select('*')
+      .eq('is_active', true)
+      .order('created_at', { ascending: false });
+
+    if (error) {
+      console.error('Error fetching learner rewards:', error);
+      return res.status(400).json({ success: false, error: error.message });
+    }
+
+    res.json({ success: true, rewards: rewards || [] });
+  } catch (error) {
+    console.error('Get learner rewards error:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch rewards' });
+  }
+});
+
+// ============ LEADERBOARD ENDPOINT ============
+
+// Get global leaderboard
+app.get('/api/leaderboard', async (req, res) => {
+  try {
+    // Get all learners with their points
+    const { data: learners, error } = await supabase
+      .from('users')
+      .select('id, username, full_name, class_level, current_points, lifetime_points, role')
+      .eq('role', 'learner')
+      .order('lifetime_points', { ascending: false });
+
+    if (error) {
+      console.error('Error fetching leaderboard:', error);
+      return res.status(400).json({ success: false, error: error.message });
+    }
+
+    // Add rank to each learner
+    const leaderboard = (learners || []).map((learner, index) => ({
+      ...learner,
+      rank: index + 1
+    }));
+
+    res.json({ 
+      success: true, 
+      leaderboard: leaderboard,
+      total: leaderboard.length
+    });
+  } catch (error) {
+    console.error('Leaderboard error:', error);
+    res.status(500).json({ success: false, error: 'Failed to fetch leaderboard' });
+  }
+});
+
+// Redeem a reward
+app.post('/api/learner/redeem-reward', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { rewardId } = req.body;
+
+    if (!rewardId) {
+      return res.status(400).json({ error: 'Reward ID is required' });
+    }
+
+    // Get the reward
+    const { data: reward, error: rewardError } = await supabase
+      .from('rewards')
+      .select('*')
+      .eq('id', rewardId)
+      .eq('is_active', true)
+      .single();
+
+    if (rewardError || !reward) {
+      return res.status(404).json({ error: 'Reward not found' });
+    }
+
+    // Check stock
+    if (reward.stock_quantity !== undefined && reward.stock_quantity <= 0) {
+      return res.status(400).json({ error: 'Reward is out of stock' });
+    }
+
+    // Get user's current points
+    const { data: userData, error: userError } = await supabase
+      .from('users')
+      .select('current_points, lifetime_points')
+      .eq('id', userId)
+      .single();
+
+    if (userError || !userData) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    // Check if user has enough points
+    if (userData.current_points < reward.points_required) {
+      return res.status(400).json({ error: 'Insufficient points' });
+    }
+
+    // Start a transaction - deduct points and update stock
+    const newPoints = userData.current_points - reward.points_required;
+    const newStock = reward.stock_quantity !== undefined ? reward.stock_quantity - 1 : null;
+
+    // Update user points
+    const { error: updatePointsError } = await supabase
+      .from('users')
+      .update({
+        current_points: newPoints,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', userId);
+
+    if (updatePointsError) {
+      console.error('Error updating points:', updatePointsError);
+      return res.status(500).json({ error: 'Failed to process redemption' });
+    }
+
+    // Update reward stock if stock is tracked
+    if (newStock !== null) {
+      const { error: updateStockError } = await supabase
+        .from('rewards')
+        .update({
+          stock_quantity: newStock,
+          updated_at: new Date().toISOString()
+        })
+        .eq('id', rewardId);
+
+      if (updateStockError) {
+        console.error('Error updating stock:', updateStockError);
+        // Rollback points if stock update fails
+        await supabase
+          .from('users')
+          .update({
+            current_points: userData.current_points,
+            updated_at: new Date().toISOString()
+          })
+          .eq('id', userId);
+        return res.status(500).json({ error: 'Failed to process redemption' });
+      }
+    }
+
+    // Record the redemption
+    const { error: redeemError } = await supabase
+      .from('redemptions')
+      .insert([{
+        user_id: userId,
+        reward_id: rewardId,
+        points_spent: reward.points_required,
+        redeemed_at: new Date().toISOString(),
+        status: 'completed'
+      }]);
+
+    if (redeemError) {
+      console.error('Error recording redemption:', redeemError);
+      // Don't fail the request, just log the error
+    }
+
+    res.json({
+      success: true,
+      message: 'Reward redeemed successfully!',
+      points_remaining: newPoints
+    });
+  } catch (error) {
+    console.error('Redeem reward error:', error);
+    res.status(500).json({ error: 'Failed to redeem reward' });
+  }
+});
+
+// Get user's redemption history
+app.get('/api/learner/redemptions', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    const { data: redemptions, error } = await supabase
+      .from('redemptions')
+      .select(`
+        *,
+        rewards:reward_id (name, image_url, points_required)
+      `)
+      .eq('user_id', userId)
+      .order('redeemed_at', { ascending: false });
+
+    if (error) {
+      return res.status(400).json({ error: error.message });
+    }
+
+    res.json({
+      success: true,
+      redemptions: redemptions || []
+    });
+  } catch (error) {
+    console.error('Get redemptions error:', error);
+    res.status(500).json({ error: 'Failed to fetch redemption history' });
+  }
+});
 
 // ============ RANDOMIZATION UTILITIES ============
 const shuffleArray = (array) => {
@@ -367,6 +775,2225 @@ function extractQuestionsFromText(text) {
   
   return questions;
 }
+
+// ============ HANGMAN ROUTES ============
+
+// Get all words (admin)
+app.get('/api/admin/hangman/words', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { data: words, error } = await supabase
+      .from('words')
+      .select('*')
+      .order('category', { ascending: true })
+      .order('word', { ascending: true });
+
+    if (error) throw error;
+
+    res.json({ success: true, words });
+  } catch (error) {
+    console.error('Error fetching words:', error);
+    res.status(500).json({ success: false, message: 'Failed to fetch words' });
+  }
+});
+
+// Add new word (admin)
+app.post('/api/admin/hangman/words', authenticateToken, requireAdmin, upload.single('image'), async (req, res) => {
+  try {
+    const { word, category, hint, difficulty, points } = req.body;
+    
+    if (!word || !category) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Word and category are required' 
+      });
+    }
+
+    // Check if word already exists in this category
+    const { data: existingWord, error: checkError } = await supabase
+      .from('words')
+      .select('id')
+      .eq('word', word.toUpperCase())
+      .eq('category', category)
+      .maybeSingle();
+
+    if (existingWord) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'This word already exists in this category' 
+      });
+    }
+
+    let imageUrl = null;
+    let imagePath = null;
+
+    // Upload image to Cloudflare R2 if provided
+    if (req.file) {
+      const fileName = `hangman/${Date.now()}-${req.file.originalname}`;
+      const uploadResult = await uploadToR2(
+        req.file.buffer,
+        fileName,
+        req.file.mimetype
+      );
+      
+      if (uploadResult.success) {
+        imageUrl = uploadResult.url;
+        imagePath = fileName;
+      } else {
+        return res.status(500).json({
+          success: false,
+          message: 'Failed to upload image'
+        });
+      }
+    }
+
+    const wordData = {
+      word: word.toUpperCase(),
+      category,
+      hint: hint || '',
+      difficulty: difficulty || 'medium',
+      points: parseInt(points) || 10,
+      image_url: imageUrl,
+      image_path: imagePath,
+      is_active: true,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    };
+
+    const { data: newWord, error } = await supabase
+      .from('words')
+      .insert([wordData])
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    res.json({ 
+      success: true, 
+      message: 'Word added successfully',
+      word: newWord 
+    });
+  } catch (error) {
+    console.error('Error adding word:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to add word: ' + error.message 
+    });
+  }
+});
+
+// Update word (admin)
+app.put('/api/admin/hangman/words/:id', authenticateToken, requireAdmin, upload.single('image'), async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { word, category, hint, difficulty, points, removeImage, is_active } = req.body;
+
+    // Get existing word
+    const { data: existingWord, error: fetchError } = await supabase
+      .from('words')
+      .select('*')
+      .eq('id', id)
+      .single();
+
+    if (fetchError || !existingWord) {
+      return res.status(404).json({ 
+        success: false, 
+        message: 'Word not found' 
+      });
+    }
+
+    let imageUrl = existingWord.image_url;
+    let imagePath = existingWord.image_path;
+
+    // Handle image removal
+    if (removeImage === 'true' || removeImage === true) {
+      if (existingWord.image_path) {
+        await deleteFromR2(existingWord.image_path);
+      }
+      imageUrl = null;
+      imagePath = null;
+    }
+
+    // Upload new image if provided
+    if (req.file) {
+      // Delete old image if exists
+      if (existingWord.image_path) {
+        await deleteFromR2(existingWord.image_path);
+      }
+
+      const fileName = `hangman/${Date.now()}-${req.file.originalname}`;
+      const uploadResult = await uploadToR2(
+        req.file.buffer,
+        fileName,
+        req.file.mimetype
+      );
+      
+      if (uploadResult.success) {
+        imageUrl = uploadResult.url;
+        imagePath = fileName;
+      } else {
+        return res.status(500).json({
+          success: false,
+          message: 'Failed to upload image'
+        });
+      }
+    }
+
+    const wordData = {
+      word: word ? word.toUpperCase() : existingWord.word,
+      category: category || existingWord.category,
+      hint: hint !== undefined ? hint : existingWord.hint,
+      difficulty: difficulty || existingWord.difficulty,
+      points: points !== undefined ? parseInt(points) : existingWord.points,
+      image_url: imageUrl,
+      image_path: imagePath,
+      updated_at: new Date().toISOString()
+    };
+
+    // Add is_active if provided (for toggling status)
+    if (is_active !== undefined) {
+      wordData.is_active = is_active;
+    }
+
+    const { data: updatedWord, error } = await supabase
+      .from('words')
+      .update(wordData)
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    res.json({ 
+      success: true, 
+      message: 'Word updated successfully',
+      word: updatedWord 
+    });
+  } catch (error) {
+    console.error('Error updating word:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to update word: ' + error.message 
+    });
+  }
+});
+
+// Delete word (admin)
+app.delete('/api/admin/hangman/words/:id', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    
+    // Get word to delete image if exists
+    const { data: word, error: fetchError } = await supabase
+      .from('words')
+      .select('image_path')
+      .eq('id', id)
+      .single();
+
+    if (fetchError) {
+      return res.status(404).json({ 
+        success: false, 
+        message: 'Word not found' 
+      });
+    }
+
+    // Delete image from Cloudflare R2 if exists
+    if (word.image_path) {
+      await deleteFromR2(word.image_path);
+    }
+
+    const { error } = await supabase
+      .from('words')
+      .delete()
+      .eq('id', id);
+
+    if (error) throw error;
+
+    res.json({ 
+      success: true, 
+      message: 'Word deleted successfully' 
+    });
+  } catch (error) {
+    console.error('Error deleting word:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to delete word: ' + error.message 
+    });
+  }
+});
+
+// Bulk import words (admin)
+app.post('/api/admin/hangman/words/import', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { words } = req.body;
+    
+    if (!Array.isArray(words) || words.length === 0) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Invalid data format' 
+      });
+    }
+
+    const imported = [];
+    const errors = [];
+
+    for (const wordData of words) {
+      const { word, category, hint, difficulty, points, image_url } = wordData;
+      
+      if (word && category) {
+        try {
+          // Check if word already exists
+          const { data: existing, error: checkError } = await supabase
+            .from('words')
+            .select('id')
+            .eq('word', word.toUpperCase())
+            .eq('category', category)
+            .maybeSingle();
+
+          if (existing) {
+            errors.push(`${word} already exists in ${category}`);
+            continue;
+          }
+
+          const newWord = {
+            word: word.toUpperCase(),
+            category,
+            hint: hint || '',
+            difficulty: difficulty || 'medium',
+            points: parseInt(points) || 10,
+            image_url: image_url || null,
+            image_path: null,
+            is_active: true,
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString()
+          };
+
+          const { data: insertedWord, error } = await supabase
+            .from('words')
+            .insert([newWord])
+            .select()
+            .single();
+
+          if (!error && insertedWord) {
+            imported.push(insertedWord);
+          } else {
+            errors.push(`Failed to import ${word}: ${error?.message}`);
+          }
+        } catch (err) {
+          errors.push(`Error importing ${word}: ${err.message}`);
+        }
+      }
+    }
+
+    res.json({ 
+      success: true, 
+      message: `Imported ${imported.length} words successfully. ${errors.length} errors.`,
+      imported,
+      errors: errors.length > 0 ? errors : undefined
+    });
+  } catch (error) {
+    console.error('Error importing words:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to import words: ' + error.message 
+    });
+  }
+});
+
+// Get word statistics (admin)
+app.get('/api/admin/hangman/stats', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    // Get total words count
+    const { count: totalWords, error: totalError } = await supabase
+      .from('words')
+      .select('*', { count: 'exact', head: true });
+
+    if (totalError) throw totalError;
+
+    // Get words with images count
+    const { count: wordsWithImages, error: imageError } = await supabase
+      .from('words')
+      .select('*', { count: 'exact', head: true })
+      .not('image_url', 'is', null);
+
+    if (imageError) throw imageError;
+
+    // Get category distribution
+    const { data: categoryData, error: catError } = await supabase
+      .from('words')
+      .select('category')
+      .not('category', 'is', null);
+
+    if (catError) throw catError;
+
+    const categoryDistribution = {};
+    categoryData.forEach(item => {
+      categoryDistribution[item.category] = (categoryDistribution[item.category] || 0) + 1;
+    });
+
+    // Get difficulty distribution
+    const { data: difficultyData, error: diffError } = await supabase
+      .from('words')
+      .select('difficulty');
+
+    if (diffError) throw diffError;
+
+    const difficultyDistribution = {};
+    difficultyData.forEach(item => {
+      const diff = item.difficulty || 'medium';
+      difficultyDistribution[diff] = (difficultyDistribution[diff] || 0) + 1;
+    });
+
+    // Get average points
+    const { data: pointsData, error: pointsError } = await supabase
+      .from('words')
+      .select('points');
+
+    if (pointsError) throw pointsError;
+
+    let totalPoints = 0;
+    pointsData.forEach(item => {
+      totalPoints += item.points || 10;
+    });
+    const avgPoints = pointsData.length > 0 ? Math.round(totalPoints / pointsData.length) : 0;
+
+    res.json({
+      success: true,
+      stats: {
+        totalWords: totalWords || 0,
+        wordsWithImages: wordsWithImages || 0,
+        avgPoints,
+        categories: Object.keys(categoryDistribution).length,
+        categoryDistribution,
+        difficultyDistribution
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching stats:', error);
+    res.status(500).json({ success: false, message: 'Failed to fetch stats' });
+  }
+});
+
+// ============ LEARNER HANGMAN ROUTES ============
+
+// Get all active words for learners
+app.get('/api/hangman/words', authenticateToken, async (req, res) => {
+  try {
+    const { data: words, error } = await supabase
+      .from('words')
+      .select('id, word, category, hint, difficulty, points, image_url')
+      .eq('is_active', true)
+      .order('category', { ascending: true })
+      .order('word', { ascending: true });
+
+    if (error) throw error;
+
+    res.json({ 
+      success: true, 
+      words: words || [],
+      count: words?.length || 0
+    });
+  } catch (error) {
+    console.error('Error fetching learner words:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to fetch words',
+      words: []
+    });
+  }
+});
+
+// Get categories with word counts for learners
+app.get('/api/hangman/categories', authenticateToken, async (req, res) => {
+  try {
+    const { data: categories, error } = await supabase
+      .from('words')
+      .select('category')
+      .eq('is_active', true)
+      .order('category');
+
+    if (error) throw error;
+
+    const categoryMap = {};
+    categories.forEach(item => {
+      categoryMap[item.category] = (categoryMap[item.category] || 0) + 1;
+    });
+
+    const result = Object.entries(categoryMap).map(([category, count]) => ({
+      category,
+      count
+    }));
+
+    res.json({ 
+      success: true, 
+      categories: result 
+    });
+  } catch (error) {
+    console.error('Error fetching learner categories:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to fetch categories' 
+    });
+  }
+});
+
+// Get words by category for learners
+app.get('/api/hangman/words/category/:category', authenticateToken, async (req, res) => {
+  try {
+    const { category } = req.params;
+    
+    const { data: words, error } = await supabase
+      .from('words')
+      .select('id, word, category, hint, difficulty, points, image_url')
+      .eq('category', category)
+      .eq('is_active', true)
+      .order('word', { ascending: true });
+
+    if (error) throw error;
+
+    res.json({ 
+      success: true, 
+      words: words || [] 
+    });
+  } catch (error) {
+    console.error('Error fetching words by category:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to fetch words' 
+    });
+  }
+});
+
+/// ============ HANGMAN TRACK ATTEMPT ENDPOINT ============
+app.post('/api/hangman/track-attempt', authenticateToken, async (req, res) => {
+  try {
+    const { wordId, correct, attempts, timeSpent } = req.body;
+    const userId = req.user.id;
+
+    console.log('📝 Tracking Hangman attempt:', { wordId, correct, attempts, timeSpent, userId });
+
+    if (!wordId) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Word ID is required' 
+      });
+    }
+
+    // First, verify the word exists and get its points
+    const { data: wordData, error: wordError } = await supabase
+      .from('words')
+      .select('id, points, word')
+      .eq('id', wordId)
+      .maybeSingle();
+
+    if (wordError) {
+      console.error('Error fetching word:', wordError);
+    }
+
+    // If word not found, try with string conversion
+    let wordIdToUse = wordId;
+    if (!wordData) {
+      console.log('Word not found with provided ID, trying string conversion...');
+      const { data: wordByString, error: stringError } = await supabase
+        .from('words')
+        .select('id, points, word')
+        .eq('id', String(wordId))
+        .maybeSingle();
+      
+      if (!stringError && wordByString) {
+        wordIdToUse = String(wordId);
+        wordData = wordByString;
+        console.log('Found word with string ID:', wordByString);
+      }
+    }
+
+    // Insert attempt record with proper error handling
+    let attemptError;
+    try {
+      const { error } = await supabase
+        .from('word_attempts')
+        .insert([{
+          word_id: wordIdToUse,
+          user_id: userId,
+          correct: correct || false,
+          attempts: attempts || 1,
+          time_spent: timeSpent || 0,
+          attempted_at: new Date().toISOString()
+        }]);
+      attemptError = error;
+    } catch (insertError) {
+      console.error('Insert error:', insertError);
+      attemptError = insertError;
+    }
+
+    if (attemptError) {
+      console.error('Error inserting attempt:', attemptError);
+      
+      // If the error is about UUID format, try with integer conversion
+      if (attemptError.code === '22P02' || attemptError.message?.includes('uuid')) {
+        console.log('🔄 UUID format error, trying integer conversion...');
+        
+        // Try to find the word with integer ID
+        const { data: wordByInt, error: intError } = await supabase
+          .from('words')
+          .select('id, points, word')
+          .eq('id', parseInt(wordId))
+          .maybeSingle();
+        
+        if (!intError && wordByInt) {
+          console.log('Found word with integer ID:', wordByInt);
+          
+          // Retry with integer ID
+          const { error: retryError } = await supabase
+            .from('word_attempts')
+            .insert([{
+              word_id: parseInt(wordId),
+              user_id: userId,
+              correct: correct || false,
+              attempts: attempts || 1,
+              time_spent: timeSpent || 0,
+              attempted_at: new Date().toISOString()
+            }]);
+          
+          if (retryError) {
+            console.error('Retry with integer ID failed:', retryError);
+            return res.status(500).json({ 
+              success: false, 
+              message: 'Failed to track attempt: ' + retryError.message 
+            });
+          }
+          
+          // Update wordData for points
+          wordData = wordByInt;
+        } else {
+          // If still can't find the word, return error
+          return res.status(400).json({ 
+            success: false, 
+            message: 'Invalid word ID format. Please use a valid ID.' 
+          });
+        }
+      } else {
+        // Other error
+        return res.status(500).json({ 
+          success: false, 
+          message: 'Failed to track attempt: ' + attemptError.message 
+        });
+      }
+    }
+
+    // If correct and word found, add points
+    if (correct && wordData) {
+      const pointsToAdd = wordData.points || 2;
+      console.log(`✅ Adding ${pointsToAdd} points to user ${userId} for word: ${wordData.word}`);
+      
+      // Get current user points
+      const { data: userData, error: userError } = await supabase
+        .from('users')
+        .select('current_points, lifetime_points')
+        .eq('id', userId)
+        .single();
+
+      if (userError) {
+        console.error('Error fetching user data:', userError);
+      } else if (userData) {
+        const newPoints = (userData.current_points || 0) + pointsToAdd;
+        const newLifetimePoints = (userData.lifetime_points || 0) + pointsToAdd;
+
+        const { error: updateError } = await supabase
+          .from('users')
+          .update({
+            current_points: newPoints,
+            lifetime_points: newLifetimePoints,
+            updated_at: new Date().toISOString()
+          })
+          .eq('id', userId);
+
+        if (updateError) {
+          console.error('Error updating points:', updateError);
+        } else {
+          console.log(`✅ Successfully added ${pointsToAdd} points to user ${userId}`);
+        }
+      }
+    }
+
+    res.json({ 
+      success: true, 
+      message: 'Attempt tracked successfully' 
+    });
+  } catch (error) {
+    console.error('Error tracking attempt:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to track attempt: ' + error.message 
+    });
+  }
+});
+
+// ============ HANGMAN USER STATS ENDPOINT ============
+app.get('/api/hangman/user-stats', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    console.log('📊 Fetching Hangman stats for user:', userId);
+
+    // Get total attempts
+    const { data: attempts, error: attemptsError } = await supabase
+      .from('word_attempts')
+      .select('correct, attempts, attempted_at, word_id')
+      .eq('user_id', userId)
+      .order('attempted_at', { ascending: false });
+
+    if (attemptsError) {
+      console.error('Error fetching attempts:', attemptsError);
+      // Return empty stats instead of error
+      return res.json({
+        success: true,
+        stats: {
+          totalAttempts: 0,
+          correctAttempts: 0,
+          successRate: 0,
+          uniqueWordsCount: 0,
+          totalPoints: 0,
+          lifetimePoints: 0,
+          recentAttempts: []
+        }
+      });
+    }
+
+    const totalAttempts = attempts?.length || 0;
+    const correctAttempts = attempts?.filter(a => a.correct).length || 0;
+    const successRate = totalAttempts > 0 ? Math.round((correctAttempts / totalAttempts) * 100) : 0;
+
+    // Get unique words attempted
+    const uniqueWords = [...new Set(attempts?.map(a => a.word_id) || [])];
+    const uniqueWordsCount = uniqueWords.length;
+
+    // Get user's total points from users table
+    const { data: userData, error: userError } = await supabase
+      .from('users')
+      .select('current_points, lifetime_points')
+      .eq('id', userId)
+      .single();
+
+    if (userError) {
+      console.error('Error fetching user data:', userError);
+      // Continue with default points
+    }
+
+    // Format recent attempts
+    const recentAttempts = (attempts || []).slice(0, 10).map(a => ({
+      id: a.id,
+      wordId: a.word_id,
+      correct: a.correct,
+      attempts: a.attempts,
+      attempted_at: a.attempted_at || a.created_at,
+      // You might want to fetch word details here if needed
+    }));
+
+    console.log(`✅ Stats: ${totalAttempts} total attempts, ${correctAttempts} correct, ${successRate}% success rate`);
+
+    res.json({
+      success: true,
+      stats: {
+        totalAttempts,
+        correctAttempts,
+        successRate,
+        uniqueWordsCount,
+        totalPoints: userData?.current_points || 0,
+        lifetimePoints: userData?.lifetime_points || 0,
+        recentAttempts
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching user stats:', error);
+    // Return empty stats instead of error to prevent UI issues
+    res.json({
+      success: true,
+      stats: {
+        totalAttempts: 0,
+        correctAttempts: 0,
+        successRate: 0,
+        uniqueWordsCount: 0,
+        totalPoints: 0,
+        lifetimePoints: 0,
+        recentAttempts: []
+      }
+    });
+  }
+});
+
+// ============ HANGMAN WORDS FOR LEARNERS ENDPOINT ============
+app.get('/api/hangman/words', authenticateToken, async (req, res) => {
+  try {
+    console.log('📚 Fetching Hangman words for learner:', req.user.id);
+
+    const { data: words, error } = await supabase
+      .from('words')
+      .select('id, word, category, hint, difficulty, points, image_url')
+      .eq('is_active', true)
+      .order('category', { ascending: true })
+      .order('word', { ascending: true });
+
+    if (error) {
+      console.error('Error fetching words:', error);
+      return res.status(500).json({ 
+        success: false, 
+        message: 'Failed to fetch words',
+        words: []
+      });
+    }
+
+    // Ensure each word has an id that can be used for tracking
+    const formattedWords = (words || []).map(word => ({
+      ...word,
+      // Ensure id is properly formatted
+      id: word.id || word._id
+    }));
+
+    console.log(`✅ Found ${formattedWords.length} words for learner`);
+
+    res.json({ 
+      success: true, 
+      words: formattedWords,
+      count: formattedWords.length
+    });
+  } catch (error) {
+    console.error('Error fetching learner words:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to fetch words',
+      words: []
+    });
+  }
+});
+
+// ============ HANGMAN CATEGORIES ENDPOINT ============
+app.get('/api/hangman/categories', authenticateToken, async (req, res) => {
+  try {
+    console.log('📚 Fetching Hangman categories for learner:', req.user.id);
+
+    const { data: categories, error } = await supabase
+      .from('words')
+      .select('category')
+      .eq('is_active', true)
+      .order('category');
+
+    if (error) {
+      console.error('Error fetching categories:', error);
+      return res.status(500).json({ 
+        success: false, 
+        message: 'Failed to fetch categories' 
+      });
+    }
+
+    // Get unique categories with counts
+    const categoryMap = {};
+    (categories || []).forEach(item => {
+      categoryMap[item.category] = (categoryMap[item.category] || 0) + 1;
+    });
+
+    const result = Object.entries(categoryMap).map(([category, count]) => ({
+      category,
+      count
+    }));
+
+    console.log(`✅ Found ${result.length} categories`);
+
+    res.json({ 
+      success: true, 
+      categories: result 
+    });
+  } catch (error) {
+    console.error('Error fetching learner categories:', error);
+    res.status(500).json({ 
+      success: false, 
+      message: 'Failed to fetch categories' 
+    });
+  }
+});
+// ==================== LEARNER SPELLING BEE ROUTES ====================
+
+// Get all active spelling words (for learners)
+app.get('/api/spelling/words', async (req, res) => {
+  try {
+    const { difficulty } = req.query;
+    
+    let query = supabase
+      .from('spelling_words')
+      .select('*')
+      .eq('is_active', true);
+    
+    if (difficulty && difficulty !== 'all') {
+      query = query.eq('difficulty', difficulty);
+    }
+    
+    const { data: words, error } = await query
+      .order('difficulty', { ascending: true })
+      .order('word', { ascending: true });
+
+    if (error) throw error;
+
+    res.json({ success: true, words });
+  } catch (error) {
+    console.error('Error fetching spelling words:', error);
+    res.status(500).json({ success: false, message: 'Failed to fetch words' });
+  }
+});
+
+// Get words by difficulty
+app.get('/api/spelling/words/difficulty/:difficulty', async (req, res) => {
+  try {
+    const { difficulty } = req.params;
+    
+    const { data: words, error } = await supabase
+      .from('spelling_words')
+      .select('*')
+      .eq('difficulty', difficulty)
+      .eq('is_active', true)
+      .order('word', { ascending: true });
+
+    if (error) throw error;
+
+    res.json({ success: true, words });
+  } catch (error) {
+    console.error('Error fetching words by difficulty:', error);
+    res.status(500).json({ success: false, message: 'Failed to fetch words' });
+  }
+});
+
+// Track spelling attempt
+app.post('/api/spelling/track-attempt', authenticateToken, async (req, res) => {
+  try {
+    const { wordId, correct, timeSpent } = req.body;
+    const userId = req.user.id;
+
+    if (!wordId) {
+      return res.status(400).json({ success: false, message: 'Word ID is required' });
+    }
+
+    // Record the attempt
+    const { error: attemptError } = await supabase
+      .from('spelling_attempts')
+      .insert([{
+        user_id: userId,
+        word_id: wordId,
+        correct,
+        time_spent: timeSpent || 0,
+        attempted_at: new Date().toISOString()
+      }]);
+
+    if (attemptError) throw attemptError;
+
+    // If correct, award points
+    if (correct) {
+      // Get word points
+      const { data: wordData, error: wordError } = await supabase
+        .from('spelling_words')
+        .select('points')
+        .eq('id', wordId)
+        .single();
+
+      if (!wordError && wordData) {
+        // Get current user points
+        const { data: userData, error: userError } = await supabase
+          .from('users')
+          .select('current_points, lifetime_points')
+          .eq('id', userId)
+          .single();
+
+        if (!userError && userData) {
+          const pointsToAdd = wordData.points || 10;
+          const newPoints = (userData.current_points || 0) + pointsToAdd;
+          const newLifetimePoints = (userData.lifetime_points || 0) + pointsToAdd;
+
+          // Update user's points
+          const { error: updateError } = await supabase
+            .from('users')
+            .update({
+              current_points: newPoints,
+              lifetime_points: newLifetimePoints,
+              updated_at: new Date().toISOString()
+            })
+            .eq('id', userId);
+
+          if (updateError) {
+            console.error('Error updating points:', updateError);
+          }
+        }
+      }
+    }
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Error tracking attempt:', error);
+    res.status(500).json({ success: false, message: 'Failed to track attempt: ' + error.message });
+  }
+});
+
+// Get user's spelling stats
+app.get('/api/spelling/user-stats', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    const { data: attempts, error } = await supabase
+      .from('spelling_attempts')
+      .select('correct, time_spent, attempted_at')
+      .eq('user_id', userId)
+      .order('attempted_at', { ascending: false });
+
+    if (error) throw error;
+
+    const totalAttempts = attempts.length;
+    const correctAttempts = attempts.filter(a => a.correct).length;
+    const successRate = totalAttempts > 0 ? Math.round((correctAttempts / totalAttempts) * 100) : 0;
+    const avgTime = totalAttempts > 0 ? Math.round(attempts.reduce((sum, a) => sum + (a.time_spent || 0), 0) / totalAttempts) : 0;
+
+    res.json({
+      success: true,
+      stats: {
+        totalAttempts,
+        correctAttempts,
+        successRate,
+        avgTime,
+        recentAttempts: attempts.slice(0, 10)
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching user stats:', error);
+    res.status(500).json({ success: false, message: 'Failed to fetch stats' });
+  }
+});
+
+// (Admin spelling routes are defined later in the file - single canonical set retained)
+
+
+// server.js - Add or update these routes
+
+// ============ SPELLING BEE TIMER SETTINGS ROUTES ============
+
+// Get timer settings (admin)
+app.get('/api/spelling/admin/timer-settings', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { data: settings, error } = await supabase
+      .from('spelling_timer_settings')
+      .select('*')
+      .limit(1)
+      .single();
+
+    if (error && error.code !== 'PGRST116') {
+      console.error('Error fetching timer settings:', error);
+      return res.status(400).json({ success: false, message: error.message });
+    }
+
+    const defaultSettings = {
+      defaultTimeLimit: 60,
+      timeLimitPerDifficulty: {
+        easy: 60,
+        medium: 45,
+        hard: 30,
+        expert: 20
+      }
+    };
+
+    if (!settings) {
+      return res.json({ success: true, settings: defaultSettings });
+    }
+
+    // Convert snake_case to camelCase for frontend
+    const formattedSettings = {
+      defaultTimeLimit: settings.default_time_limit,
+      timeLimitPerDifficulty: settings.time_limit_per_difficulty || defaultSettings.timeLimitPerDifficulty
+    };
+
+    res.json({ success: true, settings: formattedSettings });
+  } catch (error) {
+    console.error('Error in GET /api/spelling/admin/timer-settings:', error);
+    res.status(500).json({ success: false, message: 'Failed to fetch timer settings' });
+  }
+});
+
+// Save timer settings (admin)
+app.post('/api/spelling/admin/timer-settings', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { defaultTimeLimit, timeLimitPerDifficulty } = req.body;
+
+    console.log('📝 Saving timer settings:', { defaultTimeLimit, timeLimitPerDifficulty });
+
+    // Validate input
+    if (!defaultTimeLimit || defaultTimeLimit < 10 || defaultTimeLimit > 120) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Invalid default time limit. Must be between 10 and 120 seconds.' 
+      });
+    }
+
+    // Check if timeLimitPerDifficulty is valid
+    if (timeLimitPerDifficulty) {
+      const difficulties = ['easy', 'medium', 'hard', 'expert'];
+      for (const diff of difficulties) {
+        if (timeLimitPerDifficulty[diff] && (timeLimitPerDifficulty[diff] < 10 || timeLimitPerDifficulty[diff] > 120)) {
+          return res.status(400).json({ 
+            success: false, 
+            message: `Invalid time limit for ${diff}. Must be between 10 and 120 seconds.` 
+          });
+        }
+      }
+    }
+
+    const settingsData = {
+      default_time_limit: defaultTimeLimit,
+      time_limit_per_difficulty: timeLimitPerDifficulty || {
+        easy: 60,
+        medium: 45,
+        hard: 30,
+        expert: 20
+      },
+      updated_at: new Date().toISOString(),
+      updated_by: req.user.id
+    };
+
+    // Check if settings already exist
+    const { data: existing, error: checkError } = await supabase
+      .from('spelling_timer_settings')
+      .select('id')
+      .limit(1)
+      .single();
+
+    let result;
+    if (existing) {
+      // Update existing
+      const { data, error } = await supabase
+        .from('spelling_timer_settings')
+        .update(settingsData)
+        .eq('id', existing.id)
+        .select()
+        .single();
+      
+      if (error) {
+        console.error('Error updating timer settings:', error);
+        return res.status(400).json({ success: false, message: error.message });
+      }
+      result = data;
+    } else {
+      // Insert new
+      const { data, error } = await supabase
+        .from('spelling_timer_settings')
+        .insert([settingsData])
+        .select()
+        .single();
+      
+      if (error) {
+        console.error('Error inserting timer settings:', error);
+        return res.status(400).json({ success: false, message: error.message });
+      }
+      result = data;
+    }
+
+    console.log('✅ Timer settings saved successfully:', result);
+
+    // Return formatted response
+    res.json({ 
+      success: true, 
+      settings: {
+        defaultTimeLimit: result.default_time_limit,
+        timeLimitPerDifficulty: result.time_limit_per_difficulty
+      },
+      message: 'Timer settings saved successfully!' 
+    });
+  } catch (error) {
+    console.error('Error in POST /api/spelling/admin/timer-settings:', error);
+    res.status(500).json({ success: false, message: 'Failed to save timer settings: ' + error.message });
+  }
+});
+
+// Get timer settings (learners)
+app.get('/api/spelling/timer-settings', authenticateToken, async (req, res) => {
+  try {
+    const { data: settings, error } = await supabase
+      .from('spelling_timer_settings')
+      .select('*')
+      .limit(1)
+      .single();
+
+    if (error && error.code !== 'PGRST116') {
+      console.error('Error fetching timer settings:', error);
+      return res.status(400).json({ success: false, message: error.message });
+    }
+
+    const defaultSettings = {
+      defaultTimeLimit: 60,
+      timeLimitPerDifficulty: {
+        easy: 60,
+        medium: 45,
+        hard: 30,
+        expert: 20
+      }
+    };
+
+    if (!settings) {
+      return res.json({ success: true, settings: defaultSettings });
+    }
+
+    res.json({ 
+      success: true, 
+      settings: {
+        defaultTimeLimit: settings.default_time_limit,
+        timeLimitPerDifficulty: settings.time_limit_per_difficulty || defaultSettings.timeLimitPerDifficulty
+      }
+    });
+  } catch (error) {
+    console.error('Error in GET /api/spelling/timer-settings:', error);
+    res.status(500).json({ success: false, message: 'Failed to fetch timer settings' });
+  }
+});
+
+// ============ SPELLING BEE VOICE SETTINGS ROUTES ============
+
+// Get voice settings (admin)
+app.get('/api/spelling/admin/voice-settings', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { data: settings, error } = await supabase
+      .from('spelling_voice_settings')
+      .select('*')
+      .limit(1)
+      .single();
+
+    if (error && error.code !== 'PGRST116') {
+      console.error('Error fetching voice settings:', error);
+      return res.status(400).json({ success: false, message: error.message });
+    }
+
+    const defaultSettings = {
+      enabled: true,
+      useClonedVoice: false,
+      voiceSpeed: 0.9,
+      voicePitch: 1.0,
+      cloneVoiceData: null
+    };
+
+    if (!settings) {
+      return res.json({ success: true, settings: defaultSettings });
+    }
+
+    res.json({ 
+      success: true, 
+      settings: {
+        enabled: settings.enabled !== false,
+        useClonedVoice: settings.use_cloned_voice || false,
+        voiceSpeed: parseFloat(settings.voice_speed) || 0.9,
+        voicePitch: parseFloat(settings.voice_pitch) || 1.0,
+        cloneVoiceData: settings.clone_voice_data || null
+      }
+    });
+  } catch (error) {
+    console.error('Error in GET /api/spelling/admin/voice-settings:', error);
+    res.status(500).json({ success: false, message: 'Failed to fetch voice settings' });
+  }
+});
+
+// Save voice settings (admin)
+app.post('/api/spelling/admin/voice-settings', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { enabled, useClonedVoice, voiceSpeed, voicePitch, cloneVoiceData } = req.body;
+
+    console.log('📝 Saving voice settings:', { 
+      enabled, 
+      useClonedVoice, 
+      voiceSpeed, 
+      voicePitch,
+      hasCloneVoice: !!cloneVoiceData 
+    });
+
+    const settingsData = {
+      enabled: enabled !== false,
+      use_cloned_voice: useClonedVoice || false,
+      voice_speed: voiceSpeed || 0.9,
+      voice_pitch: voicePitch || 1.0,
+      clone_voice_data: cloneVoiceData || null,
+      updated_at: new Date().toISOString(),
+      updated_by: parseInt(req.user.id) // Convert to integer if needed
+    };
+
+    // Check if settings already exist
+    const { data: existing, error: checkError } = await supabase
+      .from('spelling_voice_settings')
+      .select('id')
+      .limit(1)
+      .single();
+
+    let result;
+    if (existing) {
+      // Update existing
+      const { data, error } = await supabase
+        .from('spelling_voice_settings')
+        .update(settingsData)
+        .eq('id', existing.id)
+        .select()
+        .single();
+      
+      if (error) {
+        console.error('Error updating voice settings:', error);
+        return res.status(400).json({ success: false, message: error.message });
+      }
+      result = data;
+    } else {
+      // Insert new
+      const { data, error } = await supabase
+        .from('spelling_voice_settings')
+        .insert([settingsData])
+        .select()
+        .single();
+      
+      if (error) {
+        console.error('Error inserting voice settings:', error);
+        return res.status(400).json({ success: false, message: error.message });
+      }
+      result = data;
+    }
+
+    console.log('✅ Voice settings saved successfully:', result.id);
+
+    res.json({ 
+      success: true, 
+      settings: {
+        enabled: result.enabled,
+        useClonedVoice: result.use_cloned_voice,
+        voiceSpeed: parseFloat(result.voice_speed) || 0.9,
+        voicePitch: parseFloat(result.voice_pitch) || 1.0,
+        cloneVoiceData: result.clone_voice_data
+      },
+      message: 'Voice settings saved successfully!' 
+    });
+  } catch (error) {
+    console.error('Error in POST /api/spelling/admin/voice-settings:', error);
+    res.status(500).json({ success: false, message: 'Failed to save voice settings: ' + error.message });
+  }
+});
+
+// Get voice settings (learners)
+app.get('/api/spelling/voice-settings', authenticateToken, async (req, res) => {
+  try {
+    const { data: settings, error } = await supabase
+      .from('spelling_voice_settings')
+      .select('*')
+      .limit(1)
+      .single();
+
+    if (error && error.code !== 'PGRST116') {
+      console.error('Error fetching voice settings:', error);
+      return res.status(400).json({ success: false, message: error.message });
+    }
+
+    const defaultSettings = {
+      enabled: true,
+      useClonedVoice: false,
+      voiceSpeed: 0.9,
+      voicePitch: 1.0
+    };
+
+    if (!settings) {
+      return res.json({ success: true, settings: defaultSettings });
+    }
+
+    res.json({ 
+      success: true, 
+      settings: {
+        enabled: settings.enabled !== false,
+        useClonedVoice: settings.use_cloned_voice || false,
+        voiceSpeed: parseFloat(settings.voice_speed) || 0.9,
+        voicePitch: parseFloat(settings.voice_pitch) || 1.0
+      }
+    });
+  } catch (error) {
+    console.error('Error in GET /api/spelling/voice-settings:', error);
+    res.json({ 
+      success: true, 
+      settings: {
+        enabled: true,
+        useClonedVoice: false,
+        voiceSpeed: 0.9,
+        voicePitch: 1.0
+      }
+    });
+  }
+});
+
+// Delete cloned voice (admin)
+app.delete('/api/spelling/admin/clone-voice', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { data: existing, error: checkError } = await supabase
+      .from('spelling_voice_settings')
+      .select('id')
+      .limit(1)
+      .single();
+
+    if (existing) {
+      const { error } = await supabase
+        .from('spelling_voice_settings')
+        .update({
+          clone_voice_data: null,
+          updated_at: new Date().toISOString(),
+          updated_by: parseInt(req.user.id)
+        })
+        .eq('id', existing.id);
+
+      if (error) {
+        console.error('Error deleting clone voice:', error);
+        return res.status(400).json({ success: false, message: error.message });
+      }
+    }
+
+    res.json({ success: true, message: 'Cloned voice deleted successfully' });
+  } catch (error) {
+    console.error('Error deleting clone voice:', error);
+    res.status(500).json({ success: false, message: 'Failed to delete cloned voice' });
+  }
+});
+
+
+// ============ SPELLING BEE USER PROGRESS ROUTES ============
+
+// Get user's spelling progress
+app.get('/api/spelling/user-progress', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    const { data: progress, error } = await supabase
+      .from('spelling_progress')
+      .select('*')
+      .eq('user_id', userId)
+      .single();
+
+    if (error && error.code !== 'PGRST116') {
+      console.error('Error fetching progress:', error);
+      return res.status(400).json({ success: false, message: error.message });
+    }
+
+    if (!progress) {
+      return res.json({ 
+        success: true,
+        currentLevel: 1,
+        maxUnlockedLevel: 1,
+        levelProgress: {},
+        totalScore: 0,
+        totalWordsCompleted: 0
+      });
+    }
+
+    res.json({ 
+      success: true,
+      currentLevel: progress.current_level || 1,
+      maxUnlockedLevel: progress.max_unlocked_level || 1,
+      levelProgress: progress.level_progress || {},
+      totalScore: progress.total_score || 0,
+      totalWordsCompleted: progress.total_words_completed || 0
+    });
+  } catch (error) {
+    console.error('Error in GET /api/spelling/user-progress:', error);
+    res.status(500).json({ success: false, message: 'Failed to fetch progress' });
+  }
+});
+
+// Complete a level
+app.post('/api/spelling/level-complete', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const { level, score, correctAttempts, totalAttempts } = req.body;
+
+    if (!level || level < 1 || level > 10) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Invalid level. Must be 1-10.' 
+      });
+    }
+
+    // Get existing progress
+    const { data: existing, error: fetchError } = await supabase
+      .from('spelling_progress')
+      .select('*')
+      .eq('user_id', userId)
+      .single();
+
+    let levelProgress = {};
+    let totalScore = score || 0;
+    let totalWordsCompleted = correctAttempts || 0;
+
+    if (existing) {
+      levelProgress = existing.level_progress || {};
+      totalScore = (existing.total_score || 0) + (score || 0);
+      totalWordsCompleted = (existing.total_words_completed || 0) + (correctAttempts || 0);
+    }
+
+    // Update level progress
+    levelProgress[level] = {
+      completed: true,
+      score: score || 0,
+      correctAttempts: correctAttempts || 0,
+      totalAttempts: totalAttempts || 0,
+      completedAt: new Date().toISOString()
+    };
+
+    const newMaxUnlockedLevel = Math.min(level + 1, 10);
+
+    if (existing) {
+      // Update existing progress
+      const { data, error } = await supabase
+        .from('spelling_progress')
+        .update({
+          current_level: Math.min(level + 1, 10),
+          max_unlocked_level: newMaxUnlockedLevel,
+          level_progress: levelProgress,
+          total_score: totalScore,
+          total_words_completed: totalWordsCompleted,
+          updated_at: new Date().toISOString()
+        })
+        .eq('user_id', userId)
+        .select()
+        .single();
+
+      if (error) throw error;
+    } else {
+      // Create new progress
+      const { error } = await supabase
+        .from('spelling_progress')
+        .insert([{
+          user_id: userId,
+          current_level: Math.min(level + 1, 10),
+          max_unlocked_level: newMaxUnlockedLevel,
+          level_progress: levelProgress,
+          total_score: totalScore,
+          total_words_completed: totalWordsCompleted,
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString()
+        }]);
+
+      if (error) throw error;
+    }
+
+    res.json({
+      success: true,
+      message: `Level ${level} completed successfully!`,
+      newMaxLevel: newMaxUnlockedLevel
+    });
+  } catch (error) {
+    console.error('Error in POST /api/spelling/level-complete:', error);
+    res.status(500).json({ success: false, message: 'Failed to complete level' });
+  }
+});
+
+// ============ SPELLING BEE WORDS BY LEVEL ============
+
+// Get words by level (learners) - NO DEFAULT WORDS
+app.get('/api/spelling/words/level/:level', async (req, res) => {
+  try {
+    const level = parseInt(req.params.level);
+    if (level < 1 || level > 10) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Invalid level. Must be 1-10.' 
+      });
+    }
+
+    const { data: words, error } = await supabase
+      .from('spelling_words')
+      .select('*')
+      .eq('level', level)
+      .eq('is_active', true)
+      .order('difficulty', { ascending: true })
+      .order('word', { ascending: true });
+
+    if (error) {
+      console.error('Error fetching words by level:', error);
+      return res.status(400).json({ success: false, message: error.message });
+    }
+
+    if (!words || words.length === 0) {
+      return res.json({ 
+        success: true, 
+        words: [],
+        message: `No words available for Level ${level}. Please ask an admin to add words.`
+      });
+    }
+
+    res.json({ success: true, words });
+  } catch (error) {
+    console.error('Error in GET /api/spelling/words/level/:level:', error);
+    res.status(500).json({ success: false, message: 'Failed to fetch words' });
+  }
+});
+
+// server.js - Add this route
+
+// Get voice settings (learners)
+app.get('/api/spelling/voice-settings', authenticateToken, async (req, res) => {
+  try {
+    const { data: settings, error } = await supabase
+      .from('spelling_voice_settings')
+      .select('*')
+      .limit(1)
+      .single();
+
+    if (error && error.code !== 'PGRST116') {
+      console.error('Error fetching voice settings:', error);
+      return res.status(400).json({ success: false, message: error.message });
+    }
+
+    const defaultSettings = {
+      enabled: true,
+      useClonedVoice: false,
+      voiceSpeed: 0.9,
+      voicePitch: 1.0
+    };
+
+    if (!settings) {
+      return res.json({ success: true, settings: defaultSettings });
+    }
+
+    res.json({ 
+      success: true, 
+      settings: {
+        enabled: settings.enabled !== false,
+        useClonedVoice: settings.use_cloned_voice || false,
+        voiceSpeed: settings.voice_speed || 0.9,
+        voicePitch: settings.voice_pitch || 1.0
+      }
+    });
+  } catch (error) {
+    console.error('Error in GET /api/spelling/voice-settings:', error);
+    // Return default values instead of error
+    res.json({ 
+      success: true, 
+      settings: {
+        enabled: true,
+        useClonedVoice: false,
+        voiceSpeed: 0.9,
+        voicePitch: 1.0
+      }
+    });
+  }
+});
+
+// ============ SPELLING BEE ADMIN ROUTES ============
+
+// Get all spelling words (admin)
+app.get('/api/spelling/admin/words', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { data: words, error } = await supabase
+      .from('spelling_words')
+      .select('*')
+      .order('level', { ascending: true })
+      .order('difficulty', { ascending: true })
+      .order('word', { ascending: true });
+
+    if (error) {
+      console.error('Error fetching spelling words:', error);
+      return res.status(400).json({ success: false, message: error.message });
+    }
+
+    res.json({ success: true, words: words || [] });
+  } catch (error) {
+    console.error('Error in GET /api/spelling/admin/words:', error);
+    res.status(500).json({ success: false, message: 'Failed to fetch words' });
+  }
+});
+
+// Add new spelling word (admin)
+app.post('/api/spelling/admin/words', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { word, hint, example, difficulty, level, points, is_active } = req.body;
+
+    if (!word || !difficulty || !level) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Word, difficulty, and level are required.' 
+      });
+    }
+
+    if (level < 1 || level > 10) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Level must be between 1 and 10.' 
+      });
+    }
+
+    // Check if word already exists
+    const { data: existing, error: checkError } = await supabase
+      .from('spelling_words')
+      .select('id')
+      .eq('word', word.toUpperCase())
+      .maybeSingle();
+
+    if (existing) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'This word already exists.' 
+      });
+    }
+
+    const difficultyPoints = {
+      easy: 5,
+      medium: 10,
+      hard: 15,
+      expert: 20
+    };
+
+    const newWord = {
+      word: word.toUpperCase(),
+      hint: hint || '',
+      example: example || '',
+      difficulty: difficulty,
+      level: parseInt(level),
+      points: points || difficultyPoints[difficulty] || 10,
+      is_active: is_active !== false,
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString()
+    };
+
+    const { data, error } = await supabase
+      .from('spelling_words')
+      .insert([newWord])
+      .select()
+      .single();
+
+    if (error) {
+      console.error('Error adding spelling word:', error);
+      return res.status(400).json({ success: false, message: error.message });
+    }
+
+    res.json({ success: true, word: data, message: 'Word added successfully!' });
+  } catch (error) {
+    console.error('Error in POST /api/spelling/admin/words:', error);
+    res.status(500).json({ success: false, message: 'Failed to add word' });
+  }
+});
+
+// Update spelling word (admin)
+app.put('/api/spelling/admin/words/:id', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { word, hint, example, difficulty, level, points, is_active } = req.body;
+
+    if (!word || !difficulty || !level) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Word, difficulty, and level are required.' 
+      });
+    }
+
+    if (level < 1 || level > 10) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Level must be between 1 and 10.' 
+      });
+    }
+
+    const difficultyPoints = {
+      easy: 5,
+      medium: 10,
+      hard: 15,
+      expert: 20
+    };
+
+    const updateData = {
+      word: word.toUpperCase(),
+      hint: hint || '',
+      example: example || '',
+      difficulty: difficulty,
+      level: parseInt(level),
+      points: points || difficultyPoints[difficulty] || 10,
+      updated_at: new Date().toISOString()
+    };
+
+    if (is_active !== undefined) {
+      updateData.is_active = is_active;
+    }
+
+    const { data, error } = await supabase
+      .from('spelling_words')
+      .update(updateData)
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (error) {
+      console.error('Error updating spelling word:', error);
+      return res.status(400).json({ success: false, message: error.message });
+    }
+
+    res.json({ success: true, word: data, message: 'Word updated successfully!' });
+  } catch (error) {
+    console.error('Error in PUT /api/spelling/admin/words/:id:', error);
+    res.status(500).json({ success: false, message: 'Failed to update word' });
+  }
+});
+
+// Delete spelling word (admin)
+app.delete('/api/spelling/admin/words/:id', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const { error } = await supabase
+      .from('spelling_words')
+      .delete()
+      .eq('id', id);
+
+    if (error) {
+      console.error('Error deleting spelling word:', error);
+      return res.status(400).json({ success: false, message: error.message });
+    }
+
+    res.json({ success: true, message: 'Word deleted successfully!' });
+  } catch (error) {
+    console.error('Error in DELETE /api/spelling/admin/words/:id:', error);
+    res.status(500).json({ success: false, message: 'Failed to delete word' });
+  }
+});
+
+// Bulk import spelling words (admin)
+app.post('/api/spelling/admin/words/import', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { words } = req.body;
+
+    if (!Array.isArray(words) || words.length === 0) {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Invalid data format. Expected an array of words.' 
+      });
+    }
+
+    const difficultyPoints = {
+      easy: 5,
+      medium: 10,
+      hard: 15,
+      expert: 20
+    };
+
+    let imported = 0;
+    let errors = [];
+
+    for (const wordData of words) {
+      const { word, hint, example, difficulty, level, points } = wordData;
+
+      if (word && difficulty && level) {
+        try {
+          // Check if word already exists
+          const { data: existing, error: checkError } = await supabase
+            .from('spelling_words')
+            .select('id')
+            .eq('word', word.toUpperCase())
+            .maybeSingle();
+
+          if (existing) {
+            errors.push(`Word "${word}" already exists.`);
+            continue;
+          }
+
+          const newWord = {
+            word: word.toUpperCase(),
+            hint: hint || '',
+            example: example || '',
+            difficulty: difficulty,
+            level: parseInt(level) || 1,
+            points: points || difficultyPoints[difficulty] || 10,
+            is_active: true,
+            created_at: new Date().toISOString(),
+            updated_at: new Date().toISOString()
+          };
+
+          const { error } = await supabase
+            .from('spelling_words')
+            .insert([newWord]);
+
+          if (error) {
+            errors.push(`Failed to import "${word}": ${error.message}`);
+          } else {
+            imported++;
+          }
+        } catch (err) {
+          errors.push(`Error importing "${word}": ${err.message}`);
+        }
+      } else {
+        errors.push(`Invalid word data: ${JSON.stringify(wordData)}`);
+      }
+    }
+
+    res.json({
+      success: true,
+      imported,
+      errors: errors.length > 0 ? errors : undefined,
+      message: `Successfully imported ${imported} words. ${errors.length} errors.`
+    });
+  } catch (error) {
+    console.error('Error in POST /api/spelling/admin/words/import:', error);
+    res.status(500).json({ success: false, message: 'Failed to import words' });
+  }
+});
+
+// Get spelling words (learners) - with optional filters
+app.get('/api/spelling/words', async (req, res) => {
+  try {
+    const { difficulty, level } = req.query;
+
+    let query = supabase
+      .from('spelling_words')
+      .select('*')
+      .eq('is_active', true);
+
+    if (difficulty && difficulty !== 'all') {
+      query = query.eq('difficulty', difficulty);
+    }
+
+    if (level && level !== 'all') {
+      query = query.eq('level', parseInt(level));
+    }
+
+    const { data: words, error } = await query
+      .order('level', { ascending: true })
+      .order('difficulty', { ascending: true })
+      .order('word', { ascending: true });
+
+    if (error) {
+      console.error('Error fetching spelling words:', error);
+      return res.status(400).json({ success: false, message: error.message });
+    }
+
+    res.json({ success: true, words: words || [] });
+  } catch (error) {
+    console.error('Error in GET /api/spelling/words:', error);
+    res.status(500).json({ success: false, message: 'Failed to fetch words' });
+  }
+});
+
+// Track spelling attempt (learners)
+app.post('/api/spelling/track-attempt', authenticateToken, async (req, res) => {
+  try {
+    const { wordId, correct, timeSpent, level } = req.body;
+    const userId = req.user.id;
+
+    if (!wordId) {
+      return res.status(400).json({ success: false, message: 'Word ID is required' });
+    }
+
+    // Record the attempt
+    const { error: attemptError } = await supabase
+      .from('spelling_attempts')
+      .insert([{
+        user_id: userId,
+        word_id: wordId,
+        correct: correct || false,
+        time_spent: timeSpent || 0,
+        level: level || 1,
+        attempted_at: new Date().toISOString()
+      }]);
+
+    if (attemptError) {
+      console.error('Error tracking attempt:', attemptError);
+      return res.status(400).json({ success: false, message: attemptError.message });
+    }
+
+    // If correct, award points
+    if (correct) {
+      // Get word points
+      const { data: wordData, error: wordError } = await supabase
+        .from('spelling_words')
+        .select('points')
+        .eq('id', wordId)
+        .single();
+
+      if (!wordError && wordData) {
+        // Get current user points
+        const { data: userData, error: userError } = await supabase
+          .from('users')
+          .select('current_points, lifetime_points')
+          .eq('id', userId)
+          .single();
+
+        if (!userError && userData) {
+          const pointsToAdd = wordData.points || 10;
+          const newPoints = (userData.current_points || 0) + pointsToAdd;
+          const newLifetimePoints = (userData.lifetime_points || 0) + pointsToAdd;
+
+          // Update user's points
+          const { error: updateError } = await supabase
+            .from('users')
+            .update({
+              current_points: newPoints,
+              lifetime_points: newLifetimePoints,
+              updated_at: new Date().toISOString()
+            })
+            .eq('id', userId);
+
+          if (updateError) {
+            console.error('Error updating points:', updateError);
+          }
+        }
+      }
+    }
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error('Error in POST /api/spelling/track-attempt:', error);
+    res.status(500).json({ success: false, message: 'Failed to track attempt' });
+  }
+});
+
+// Get user's spelling stats
+app.get('/api/spelling/user-stats', authenticateToken, async (req, res) => {
+  try {
+    const userId = req.user.id;
+
+    const { data: attempts, error } = await supabase
+      .from('spelling_attempts')
+      .select('correct, time_spent, attempted_at, level')
+      .eq('user_id', userId)
+      .order('attempted_at', { ascending: false });
+
+    if (error) {
+      console.error('Error fetching user stats:', error);
+      return res.status(400).json({ success: false, message: error.message });
+    }
+
+    const totalAttempts = attempts.length;
+    const correctAttempts = attempts.filter(a => a.correct).length;
+    const successRate = totalAttempts > 0 ? Math.round((correctAttempts / totalAttempts) * 100) : 0;
+    const avgTime = totalAttempts > 0 ? Math.round(attempts.reduce((sum, a) => sum + (a.time_spent || 0), 0) / totalAttempts) : 0;
+
+    // Get level distribution
+    const levelDistribution = {};
+    attempts.forEach(a => {
+      const level = a.level || 1;
+      levelDistribution[level] = (levelDistribution[level] || 0) + 1;
+    });
+
+    res.json({
+      success: true,
+      stats: {
+        totalAttempts,
+        correctAttempts,
+        successRate,
+        avgTime,
+        levelDistribution,
+        recentAttempts: attempts.slice(0, 10)
+      }
+    });
+  } catch (error) {
+    console.error('Error in GET /api/spelling/user-stats:', error);
+    res.status(500).json({ success: false, message: 'Failed to fetch stats' });
+  }
+});
+
+// ============ ADVANCED EXTRACTION ENDPOINT ============
+app.post('/api/admin/extract-questions-advanced', authenticateToken, requireAdmin, upload.single('file'), async (req, res) => {
+  console.log('='.repeat(50));
+  console.log('📄 ADVANCED EXTRACTION REQUEST');
+  console.log('='.repeat(50));
+  
+  try {
+    if (!req.file) {
+      console.log('❌ No file provided');
+      return res.status(400).json({ 
+        success: false, 
+        message: 'No file provided. Please select a PDF or CSV file.' 
+      });
+    }
+
+    console.log(`📁 File: ${req.file.originalname}`);
+    console.log(`📁 Type: ${req.file.mimetype}`);
+    console.log(`📁 Size: ${req.file.size} bytes`);
+
+    let extractedText = '';
+    let questions = [];
+
+    // Handle PDF files
+    if (req.file.mimetype === 'application/pdf' || req.file.originalname.toLowerCase().endsWith('.pdf')) {
+      console.log('🔄 Processing PDF file with advanced parser...');
+      
+      if (!pdfParse) {
+        console.error('❌ PDF parser not available');
+        return res.status(500).json({ 
+          success: false, 
+          message: 'PDF parser is not installed. Please run: npm install pdf-parse@1.1.1' 
+        });
+      }
+      
+      try {
+        const data = await pdfParse(req.file.buffer);
+        extractedText = data.text;
+        console.log(`📄 PDF text length: ${extractedText.length} characters`);
+        
+        questions = extractQuestionsFromText(extractedText);
+        console.log(`✅ Extracted ${questions.length} questions from PDF`);
+        
+      } catch (pdfError) {
+        console.error('❌ PDF parsing error:', pdfError);
+        return res.status(400).json({ 
+          success: false, 
+          message: `Failed to parse PDF: ${pdfError.message}` 
+        });
+      }
+    }
+    // Handle CSV files
+    else if (req.file.mimetype === 'text/csv' || req.file.originalname.toLowerCase().endsWith('.csv')) {
+      console.log('🔄 Processing CSV file with advanced parser...');
+      
+      try {
+        const csvText = req.file.buffer.toString('utf-8');
+        const lines = csvText.split('\n');
+        
+        if (lines.length < 2) {
+          throw new Error('CSV must have at least a header row and one data row');
+        }
+        
+        // Detect headers
+        const firstRow = lines[0].toLowerCase();
+        const hasHeader = firstRow.includes('question') || firstRow.includes('option');
+        const startRow = hasHeader ? 1 : 0;
+        
+        for (let i = startRow; i < Math.min(lines.length, 500); i++) {
+          if (!lines[i].trim()) continue;
+          
+          const values = parseCSVRow(lines[i]);
+          if (values.length < 5) continue;
+          
+          const questionText = values[0]?.trim();
+          const options = [
+            values[1]?.trim() || '',
+            values[2]?.trim() || '',
+            values[3]?.trim() || '',
+            values[4]?.trim() || ''
+          ];
+          let correctAnswer = values[5]?.trim() || '';
+          
+          // Handle letter-based correct answer (e.g., "A", "B", etc.)
+          if (correctAnswer && correctAnswer.match(/^[A-D]$/i)) {
+            const letterIndex = correctAnswer.toUpperCase().charCodeAt(0) - 65;
+            correctAnswer = options[letterIndex] || options[0];
+          }
+          
+          // Handle correct answer markers in options
+          for (let j = 0; j < options.length; j++) {
+            if (options[j].includes('✓') || options[j].includes('*') || options[j].includes('(correct)')) {
+              correctAnswer = options[j].replace(/[✓*]/g, '').replace(/\(correct\)/i, '').trim();
+              options[j] = correctAnswer;
+              break;
+            }
+          }
+          
+          if (questionText && options.some(o => o)) {
+            questions.push({
+              id: `csv-${Date.now()}-${questions.length}`,
+              question: questionText,
+              options: ensureFourOptions(options),
+              correctAnswer: correctAnswer || options[0] || '',
+              layout: 'text-first',
+              questionImage: '',
+              difficulty: 'intermediate'
+            });
+          }
+        }
+        
+        console.log(`✅ Extracted ${questions.length} questions from CSV`);
+        
+      } catch (csvError) {
+        console.error('❌ CSV parsing error:', csvError);
+        return res.status(400).json({ 
+          success: false, 
+          message: `Failed to parse CSV: ${csvError.message}` 
+        });
+      }
+    }
+    // Handle DOCX files
+    else if (req.file.mimetype === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' || 
+             req.file.originalname.toLowerCase().endsWith('.docx')) {
+      console.log('🔄 Processing DOCX file...');
+      
+      try {
+        const mammoth = require('mammoth');
+        const result = await mammoth.extractRawText({ buffer: req.file.buffer });
+        extractedText = result.value;
+        console.log(`📄 DOCX text length: ${extractedText.length} characters`);
+        
+        questions = extractQuestionsFromText(extractedText);
+        console.log(`✅ Extracted ${questions.length} questions from DOCX`);
+        
+      } catch (docxError) {
+        console.error('❌ DOCX parsing error:', docxError);
+        return res.status(400).json({ 
+          success: false, 
+          message: `Failed to parse DOCX: ${docxError.message}. Please install mammoth: npm install mammoth` 
+        });
+      }
+    }
+    else {
+      return res.status(400).json({ 
+        success: false, 
+        message: 'Unsupported file type. Please upload PDF, CSV, or DOCX files.' 
+      });
+    }
+
+    if (questions.length === 0) {
+      console.log('❌ No questions extracted');
+      return res.status(400).json({ 
+        success: false, 
+        message: 'No valid questions found. Please ensure the file has properly formatted questions with options A, B, C, D.' 
+      });
+    }
+
+    // Clean and validate all questions
+    questions = questions.filter(q => {
+      const hasQuestion = q.question && q.question.trim().length > 0;
+      const hasValidOptions = q.options && q.options.some(opt => opt && opt.trim().length > 0);
+      const hasCorrectAnswer = q.correctAnswer && q.correctAnswer.trim().length > 0;
+      return hasQuestion && hasValidOptions && hasCorrectAnswer;
+    });
+
+    // Ensure each question has correct answer in options
+    questions = questions.map(q => {
+      let correctAnswer = q.correctAnswer;
+      if (!q.options.includes(correctAnswer)) {
+        correctAnswer = q.options[0] || '';
+      }
+      return {
+        ...q,
+        options: ensureFourOptions(q.options),
+        correctAnswer: correctAnswer
+      };
+    });
+
+    // Remove duplicates
+    const seenQuestions = new Set();
+    const uniqueQuestions = [];
+    for (const q of questions) {
+      const normalizedQuestion = q.question.toLowerCase().trim();
+      if (!seenQuestions.has(normalizedQuestion)) {
+        seenQuestions.add(normalizedQuestion);
+        uniqueQuestions.push(q);
+      }
+    }
+
+    console.log(`✅ SUCCESS: Returning ${uniqueQuestions.length} unique questions from ${questions.length} total`);
+    console.log('='.repeat(50));
+    
+    res.json({
+      success: true,
+      questions: uniqueQuestions,
+      stats: {
+        total_extracted: questions.length,
+        unique: uniqueQuestions.length,
+        duplicates_removed: questions.length - uniqueQuestions.length
+      },
+      message: `Successfully extracted ${uniqueQuestions.length} unique questions from ${req.file.originalname}.`
+    });
+    
+  } catch (error) {
+    console.error('❌ FATAL ERROR:', error);
+    console.error('Stack:', error.stack);
+    console.log('='.repeat(50));
+    
+    res.status(500).json({ 
+      success: false, 
+      message: `Server error: ${error.message}` 
+    });
+  }
+});
 
 // ============ QUESTION BANK ENDPOINTS ============
 
@@ -846,10 +3473,10 @@ app.get('/api/admin/dashboard-stats', authenticateToken, requireAdmin, async (re
   }
 });
 
-// ============ PDF UPLOAD AND EXTRACTION ENDPOINT ============
+// ============ PDF UPLOAD AND EXTRACTION ENDPOINT (Legacy) ============
 app.post('/api/admin/extract-questions', authenticateToken, requireAdmin, upload.single('pdf'), async (req, res) => {
   console.log('='.repeat(50));
-  console.log('📄 PDF EXTRACTION REQUEST');
+  console.log('📄 PDF EXTRACTION REQUEST (Legacy)');
   console.log('='.repeat(50));
   
   try {
@@ -1168,7 +3795,7 @@ app.post('/api/auth/login', async (req, res) => {
 
     const token = jwt.sign(
       { id: user.id, username: user.username, role: user.role },
-      process.env.JWT_SECRET,
+      JWT_SECRET,
       { expiresIn: '7d' }
     );
 
@@ -1195,7 +3822,7 @@ app.post('/api/auth/test-login', (req, res) => {
   if (username === 'admin' && password === 'admin123') {
     const token = jwt.sign(
       { id: 1, username: 'admin', role: 'admin' },
-      process.env.JWT_SECRET,
+      JWT_SECRET,
       { expiresIn: '7d' }
     );
     
@@ -1255,7 +3882,7 @@ app.post('/api/auth/learner-login', async (req, res) => {
 
     const token = jwt.sign(
       { id: user.id, username: user.username, role: user.role },
-      process.env.JWT_SECRET,
+      JWT_SECRET,
       { expiresIn: '7d' }
     );
 
@@ -2409,32 +5036,358 @@ app.get('/api/debug-admin', async (req, res) => {
   }
 });
 
+// ============ ADMIN BADGES ENDPOINTS ============
+
+// Get all badges
+app.get('/api/admin/badges', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { data: badges, error } = await supabase
+      .from('badges')
+      .select('*')
+      .order('created_at', { ascending: false });
+
+    if (error) {
+      console.error('Error fetching badges:', error);
+      return res.status(400).json({ success: false, message: 'Failed to fetch badges' });
+    }
+
+    res.json({ success: true, badges: badges || [] });
+  } catch (error) {
+    console.error('Fetch badges error:', error);
+    res.status(500).json({ success: false, message: 'Failed to fetch badges' });
+  }
+});
+
+// Create a new badge
+app.post('/api/admin/badges', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const {
+      name,
+      description,
+      icon_url,
+      criteria,
+      is_active,
+      automation_enabled,
+      automation_trigger,
+      automation_condition,
+      automation_threshold,
+      automation_points_reward
+    } = req.body;
+
+    if (!name) {
+      return res.status(400).json({ success: false, message: 'Badge name is required' });
+    }
+
+    // Check if badge with same name exists
+    const { data: existingBadge } = await supabase
+      .from('badges')
+      .select('id')
+      .eq('name', name.trim())
+      .single();
+
+    if (existingBadge) {
+      return res.status(400).json({ success: false, message: 'A badge with this name already exists' });
+    }
+
+    const { data: badge, error } = await supabase
+      .from('badges')
+      .insert([{
+        name: name.trim(),
+        description: description || 'No description provided',
+        icon_url: icon_url || '',
+        criteria: criteria || 'Complete the required actions to earn this badge',
+        is_active: is_active !== undefined ? is_active : true,
+        automation_enabled: automation_enabled || false,
+        automation_trigger: automation_trigger || '',
+        automation_condition: automation_condition || 'greater_equal',
+        automation_threshold: automation_threshold || 0,
+        automation_points_reward: automation_points_reward || 0,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString()
+      }])
+      .select()
+      .single();
+
+    if (error) {
+      console.error('Error creating badge:', error);
+      return res.status(400).json({ success: false, message: 'Failed to create badge' });
+    }
+
+    res.status(201).json({ success: true, badge });
+  } catch (error) {
+    console.error('Create badge error:', error);
+    res.status(500).json({ success: false, message: 'Failed to create badge' });
+  }
+});
+
+// Update a badge
+app.put('/api/admin/badges/:id', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const {
+      name,
+      description,
+      icon_url,
+      criteria,
+      is_active,
+      automation_enabled,
+      automation_trigger,
+      automation_condition,
+      automation_threshold,
+      automation_points_reward
+    } = req.body;
+
+    // Check if badge exists
+    const { data: existingBadge } = await supabase
+      .from('badges')
+      .select('*')
+      .eq('id', id)
+      .single();
+
+    if (!existingBadge) {
+      return res.status(404).json({ success: false, message: 'Badge not found' });
+    }
+
+    // If name is changing, check for duplicates
+    if (name && name.trim() !== existingBadge.name) {
+      const { data: duplicate } = await supabase
+        .from('badges')
+        .select('id')
+        .eq('name', name.trim())
+        .single();
+
+      if (duplicate) {
+        return res.status(400).json({ success: false, message: 'A badge with this name already exists' });
+      }
+    }
+
+    const { data: badge, error } = await supabase
+      .from('badges')
+      .update({
+        name: name ? name.trim() : existingBadge.name,
+        description: description !== undefined ? description : existingBadge.description,
+        icon_url: icon_url !== undefined ? icon_url : existingBadge.icon_url,
+        criteria: criteria !== undefined ? criteria : existingBadge.criteria,
+        is_active: is_active !== undefined ? is_active : existingBadge.is_active,
+        automation_enabled: automation_enabled !== undefined ? automation_enabled : existingBadge.automation_enabled,
+        automation_trigger: automation_trigger !== undefined ? automation_trigger : existingBadge.automation_trigger,
+        automation_condition: automation_condition !== undefined ? automation_condition : existingBadge.automation_condition,
+        automation_threshold: automation_threshold !== undefined ? automation_threshold : existingBadge.automation_threshold,
+        automation_points_reward: automation_points_reward !== undefined ? automation_points_reward : existingBadge.automation_points_reward,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (error) {
+      console.error('Error updating badge:', error);
+      return res.status(400).json({ success: false, message: 'Failed to update badge' });
+    }
+
+    res.json({ success: true, badge });
+  } catch (error) {
+    console.error('Update badge error:', error);
+    res.status(500).json({ success: false, message: 'Failed to update badge' });
+  }
+});
+
+// Delete a badge
+app.delete('/api/admin/badges/:id', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    const { data: badge, error } = await supabase
+      .from('badges')
+      .delete()
+      .eq('id', id)
+      .select()
+      .single();
+
+    if (error) {
+      console.error('Error deleting badge:', error);
+      return res.status(404).json({ success: false, message: 'Badge not found' });
+    }
+
+    res.json({ success: true, message: 'Badge deleted successfully' });
+  } catch (error) {
+    console.error('Delete badge error:', error);
+    res.status(500).json({ success: false, message: 'Failed to delete badge' });
+  }
+});
+
+// Assign badge to a learner
+app.post('/api/admin/badges/assign', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { badgeId, learnerId } = req.body;
+
+    if (!badgeId || !learnerId) {
+      return res.status(400).json({ success: false, message: 'Badge ID and Learner ID are required' });
+    }
+
+    // Check if badge exists
+    const { data: badge } = await supabase
+      .from('badges')
+      .select('id')
+      .eq('id', badgeId)
+      .single();
+
+    if (!badge) {
+      return res.status(404).json({ success: false, message: 'Badge not found' });
+    }
+
+    // Check if learner exists
+    const { data: learner } = await supabase
+      .from('users')
+      .select('id')
+      .eq('id', learnerId)
+      .eq('role', 'learner')
+      .single();
+
+    if (!learner) {
+      return res.status(404).json({ success: false, message: 'Learner not found' });
+    }
+
+    // Check if learner already has this badge
+    const { data: existingAssignment } = await supabase
+      .from('learner_badges')
+      .select('id')
+      .eq('learner_id', learnerId)
+      .eq('badge_id', badgeId)
+      .single();
+
+    if (existingAssignment) {
+      return res.status(400).json({ success: false, message: 'Learner already has this badge' });
+    }
+
+    // Assign the badge
+    const { error } = await supabase
+      .from('learner_badges')
+      .insert([{
+        learner_id: learnerId,
+        badge_id: badgeId,
+        assigned_at: new Date().toISOString()
+      }]);
+
+    if (error) {
+      console.error('Error assigning badge:', error);
+      return res.status(400).json({ success: false, message: 'Failed to assign badge' });
+    }
+
+    res.json({ success: true, message: 'Badge assigned successfully' });
+  } catch (error) {
+    console.error('Assign badge error:', error);
+    res.status(500).json({ success: false, message: 'Failed to assign badge' });
+  }
+});
+
+// Get all learners
+app.get('/api/admin/learners', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { data: learners, error } = await supabase
+      .from('users')
+      .select('id, username, email, full_name, class_level, current_points, lifetime_points, role')
+      .eq('role', 'learner')
+      .order('full_name', { ascending: true });
+
+    if (error) {
+      console.error('Error fetching learners:', error);
+      return res.status(400).json({ success: false, message: 'Failed to fetch learners' });
+    }
+
+    res.json({ success: true, learners: learners || [] });
+  } catch (error) {
+    console.error('Fetch learners error:', error);
+    res.status(500).json({ success: false, message: 'Failed to fetch learners' });
+  }
+});
+
+// Upload image for badge
+app.post('/api/admin/upload-image', authenticateToken, requireAdmin, upload.single('image'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ success: false, message: 'No image file provided' });
+    }
+
+    const file = req.file;
+    const fileName = `badges/${Date.now()}-${file.originalname}`;
+
+    // Upload to R2
+    const uploadResult = await uploadToR2(file.buffer, fileName, file.mimetype);
+
+    if (!uploadResult.success) {
+      console.error('Error uploading to R2:', uploadResult.error);
+      return res.status(500).json({ success: false, message: 'Failed to upload image' });
+    }
+
+    res.json({ success: true, imageUrl: uploadResult.url });
+  } catch (error) {
+    console.error('Upload image error:', error);
+    res.status(500).json({ success: false, message: 'Failed to upload image' });
+  }
+});
+
 // Error handling middleware
 app.use((err, req, res, next) => {
   console.error('Server error:', err);
   res.status(500).json({ error: 'Internal server error' });
 });
 
-// Start server
+// Start server with Supabase DNS check and client initialization
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
-  console.log(`🚀 Learn & Earn server running on http://localhost:${PORT}`);
-  console.log(`📊 Health check: http://localhost:${PORT}/health`);
-  console.log(`📄 PDF extraction: POST to http://localhost:${PORT}/api/admin/extract-questions`);
-  console.log(`📊 Admin activities: GET to http://localhost:${PORT}/api/admin/activities`);
-  console.log(`📊 Dashboard stats: GET to http://localhost:${PORT}/api/admin/dashboard-stats`);
-  console.log(`📚 Question Bank: GET to http://localhost:${PORT}/api/admin/question-bank`);
-  console.log(`📚 Question Bank Stats: GET to http://localhost:${PORT}/api/admin/question-bank/stats`);
-  console.log(`📝 Save Question: POST to http://localhost:${PORT}/api/admin/question-bank`);
-  console.log(`🎲 Generate Quiz: GET to http://localhost:${PORT}/api/quiz/generate`);
-  console.log(`🖼️ Image upload: POST to http://localhost:${PORT}/api/admin/upload-image`);
-  console.log(`👥 Learner Management: GET/POST to http://localhost:${PORT}/api/admin/learners`);
-  console.log(`📈 Level Progression: GET/POST to http://localhost:${PORT}/api/learner/progress`);
-  console.log(`🔓 Level Access Check: GET to http://localhost:${PORT}/api/learner/can-access-level/:level`);
-  console.log(`✅ Auto-detection of correct answers is enabled for PDF imports`);
-  console.log(`🎲 Question and option randomization is enabled for learners`);
-  console.log(`📚 Class assignment endpoints are enabled`);
-  console.log(`🎯 Random question selection from question bank is enabled`);
-  console.log(`🔐 Progressive level unlocking is enabled`);
-  console.log(`⚡ Strict class-level relationship enforced (Standards 5-8 only)`);
-});
+
+(async () => {
+  try {
+    const dns = require('dns').promises;
+    const supabaseUrl = process.env.SUPABASE_URL;
+
+    if (!supabaseUrl) {
+      console.error('❌ SUPABASE_URL is not set in .env. Set SUPABASE_URL to your Supabase project URL.');
+      process.exit(1);
+    }
+
+    let hostname;
+    try {
+      hostname = new URL(supabaseUrl).hostname;
+    } catch (err) {
+      console.error('❌ SUPABASE_URL is invalid:', supabaseUrl);
+      process.exit(1);
+    }
+
+    try {
+      await dns.lookup(hostname);
+      console.log(`✅ DNS lookup successful for ${hostname}`);
+    } catch (err) {
+      console.error(`❌ DNS lookup failed for ${hostname}:`, err.message || err);
+      console.error('Possible causes: no internet connection, incorrect SUPABASE_URL, or the Supabase project was deleted/renamed.');
+      console.error('Check your SUPABASE_URL in backend/.env and ensure the host resolves from this machine.');
+      process.exit(1);
+    }
+
+    // Initialize Supabase client now that DNS is confirmed
+    const { createClient } = require('@supabase/supabase-js');
+    supabase = createClient(
+      process.env.SUPABASE_URL,
+      process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY
+    );
+
+    app.listen(PORT, () => {
+      console.log(`🚀 Learn & Earn server running on http://localhost:${PORT}`);
+      console.log(`📊 Health check: http://localhost:${PORT}/health`);
+      console.log(`🎁 Rewards endpoints: http://localhost:${PORT}/api/admin/rewards`);
+      console.log(`🎁 Create reward: POST http://localhost:${PORT}/api/admin/create-reward`);
+      console.log(`🎁 Update reward: POST http://localhost:${PORT}/api/admin/update-reward/:id`);
+      console.log(`🎁 Delete reward: DELETE http://localhost:${PORT}/api/admin/delete-reward/:id`);
+      console.log(`🎁 Learner rewards: GET http://localhost:${PORT}/api/learner/rewards`);
+      console.log(`🏆 Leaderboard: GET http://localhost:${PORT}/api/leaderboard`);
+      console.log(`🕹️ HANGMAN: Admin routes at /api/admin/hangman/*`);
+      console.log(`🕹️ HANGMAN: Learner routes at /api/hangman/*`);
+      console.log(`🔤 SPELLING BEE: Admin routes at /api/spelling/admin/*`);
+      console.log(`🔤 SPELLING BEE: Learner routes at /api/spelling/*`);
+    });
+
+  } catch (err) {
+    console.error('Server startup error:', err);
+    process.exit(1);
+  }
+})();
