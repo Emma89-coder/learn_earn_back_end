@@ -1,11 +1,73 @@
 // backend/routes/admin/ai.js
 const express = require('express');
 const router = express.Router();
+const multer = require('multer');
+const OpenAI = require('openai');
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 }
+});
 
 // Import middleware from the correct path
 const { authenticateToken, isAdmin } = require('../../middleware/auth');
 
+let pdfParse;
+try {
+  const pdfParseModule = require('pdf-parse');
+  pdfParse = pdfParseModule.default || pdfParseModule;
+} catch (error) {
+  pdfParse = null;
+}
+
+const getOpenAIClient = () => {
+  const apiKey = process.env.OPENAI_API_KEY;
+  if (!apiKey || apiKey === 'your_openai_key_here' || apiKey.trim() === '') {
+    return null;
+  }
+
+  return new OpenAI({ apiKey });
+};
+
 // Mock AI responses
+const normalizeQuestion = (question, index, fallbackSubject, fallbackDifficulty) => {
+  const cleanQuestion = typeof question?.question === 'string' ? question.question.trim() : '';
+  const rawOptions = Array.isArray(question?.options) ? question.options : [];
+  const options = rawOptions
+    .map((opt) => String(opt || '').replace(/^[A-Da-d][\.)\-:\s]*/g, '').trim())
+    .filter(Boolean)
+    .slice(0, 4);
+
+  const finalOptions = options.length >= 4
+    ? options.slice(0, 4)
+    : [
+        `Correct answer about ${fallbackSubject || 'this topic'}`,
+        `Common misconception about ${fallbackSubject || 'this topic'}`,
+        `Related but incorrect concept`,
+        `Unrelated fact`
+      ].slice(0, 4);
+
+  const answerText = typeof question?.correctAnswer === 'string'
+    ? question.correctAnswer.replace(/^[A-Da-d][\.)\-:\s]*/g, '').trim()
+    : '';
+
+  const normalizedCorrectAnswer = finalOptions.includes(answerText)
+    ? answerText
+    : (finalOptions[0] || 'Correct answer');
+
+  return {
+    id: question?.id || `ai-${Date.now()}-${index}-${Math.random().toString(36).slice(2, 9)}`,
+    question: cleanQuestion || `What is a key concept in ${fallbackSubject || 'this topic'}?`,
+    options: finalOptions,
+    correctAnswer: normalizedCorrectAnswer,
+    layout: question?.layout || 'text-first',
+    questionImage: question?.questionImage || '',
+    explanation: question?.explanation || `This answer is correct because it matches the core idea of ${fallbackSubject || 'the topic'}.`,
+    difficulty: question?.difficulty || fallbackDifficulty || 'medium',
+    subject: question?.subject || fallbackSubject || 'general'
+  };
+};
+
 const mockAI = {
   generateQuestions: (topic, subject, difficulty, count) => {
     try {
@@ -41,6 +103,25 @@ const mockAI = {
       console.error('Error in generateQuestions:', error);
       throw error;
     }
+  },
+
+  generateHangmanHint: (word, category) => {
+    const normalizedWord = String(word || '').trim();
+    if (!normalizedWord) return 'Think of a word related to this subject.';
+
+    const root = normalizedWord.length <= 4 ? 'short' : normalizedWord.length <= 7 ? 'medium' : 'long';
+    const categoryHints = {
+      mathematics: 'Think of a mathematical term or concept.',
+      science: 'Think of a science word or natural process.',
+      english: 'Think of a vocabulary word used in English.',
+      'social-studies': 'Think of a place, event, or idea from social studies.',
+      'bible-knowledge': 'Think of a biblical idea or key figure.',
+      'arts-life-skills': 'Think of a creative or practical everyday word.',
+      chichewa: 'Think of a common Chichewa word used in everyday life.'
+    };
+
+    const base = categoryHints[String(category || '').toLowerCase()] || 'Think of a word related to this subject.';
+    return `${base} It has ${normalizedWord.length} letters and is a ${root}-length word.`;
   },
   
   improveQuestion: (question, options, correctAnswer) => {
@@ -127,6 +208,107 @@ router.get('/health', authenticateToken, isAdmin, (req, res) => {
   }
 });
 
+const generateQuestionsFromTextSource = async (sourceText, subject, difficulty, count) => {
+  const ai = getOpenAIClient();
+  const questionCount = Math.min(Math.max(1, parseInt(count) || 5), 20);
+
+  if (!sourceText || !sourceText.trim()) {
+    throw new Error('Source text is required');
+  }
+
+  if (!ai) {
+    return mockAI.generateQuestions(sourceText.slice(0, 120), subject, difficulty, questionCount);
+  }
+
+  try {
+    const text = String(sourceText).replace(/\s+/g, ' ').trim();
+    const sourceSnippet = text.length > 3000 ? text.slice(0, 3000) : text;
+
+    const response = await ai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      temperature: 0.7,
+      messages: [
+        {
+          role: 'system',
+          content: 'You are an expert curriculum designer. Generate quiz questions directly from the provided source material. Return only valid JSON. Root object must contain a "questions" array. Each question must include id, question, options, correctAnswer, layout, questionImage, explanation, difficulty, subject. Make each question based on the content, not generic filler. Ensure the option values are plain strings without letters like A/B/C/D and correctAnswer exactly matches one of the options.'
+        },
+        {
+          role: 'user',
+          content: `Create ${questionCount} multiple-choice questions from this study material. Subject: "${subject || 'general'}". Difficulty: "${difficulty || 'medium'}". Source material: ${sourceSnippet} Return JSON in the exact structure: {"questions":[{"id":"q1","question":"...","options":["...","...","...","..."],"correctAnswer":"...","layout":"text-first","questionImage":"","explanation":"...","difficulty":"${difficulty || 'medium'}","subject":"${subject || 'general'}"}]}`
+        }
+      ],
+      response_format: { type: 'json_object' }
+    });
+
+    const content = response?.choices?.[0]?.message?.content;
+    if (!content) {
+      return mockAI.generateQuestions(sourceSnippet.slice(0, 120), subject, difficulty, questionCount);
+    }
+
+    const cleanedContent = String(content).replace(/^```json\s*|```\s*$/gi, '').trim();
+    const parsed = JSON.parse(cleanedContent);
+    const sourceQuestions = Array.isArray(parsed?.questions) ? parsed.questions : [];
+
+    if (!sourceQuestions.length) {
+      return mockAI.generateQuestions(sourceSnippet.slice(0, 120), subject, difficulty, questionCount);
+    }
+
+    return sourceQuestions.slice(0, questionCount).map((question, index) => normalizeQuestion(question, index, subject || 'general', difficulty || 'medium'));
+  } catch (error) {
+    console.warn('OpenAI text-source question generation failed, using fallback:', error.message || error);
+    return mockAI.generateQuestions(sourceText.slice(0, 120), subject, difficulty, questionCount);
+  }
+};
+
+const generateQuestionsWithAI = async (topic, subject, difficulty, count) => {
+  const ai = getOpenAIClient();
+  const questionCount = Math.min(Math.max(1, parseInt(count) || 5), 20);
+
+  if (!ai) {
+    return mockAI.generateQuestions(topic, subject, difficulty, questionCount);
+  }
+
+  try {
+    const response = await ai.chat.completions.create({
+      model: 'gpt-4o-mini',
+      temperature: 0.7,
+      messages: [
+        {
+          role: 'system',
+          content: 'You are an expert curriculum designer. Create high-quality multiple-choice questions in a clear educational tone. Return only valid JSON. The root object must contain a "questions" array. Each question object must contain: id, question, options, correctAnswer, layout, questionImage, explanation, difficulty, subject. Keep the question text clear and specific. Ensure options are exactly four strings, no letters like A/B/C/D in the values, and correctAnswer must exactly match one of the option strings.'
+        },
+        {
+          role: 'user',
+          content: `Generate ${questionCount} multiple-choice questions about "${topic}" for the subject "${subject || 'general'}" with difficulty "${difficulty || 'medium'}". Use a realistic classroom level and include a brief explanation for the correct answer. Return JSON in this exact structure: {"questions":[{"id":"q1","question":"...","options":["...","...","...","..."],"correctAnswer":"...","layout":"text-first","questionImage":"","explanation":"...","difficulty":"${difficulty || 'medium'}","subject":"${subject || 'general'}"}]}`
+        }
+      ],
+      response_format: { type: 'json_object' }
+    });
+
+    const content = response?.choices?.[0]?.message?.content;
+    if (!content) {
+      return mockAI.generateQuestions(topic, subject, difficulty, questionCount);
+    }
+
+    const cleanedContent = String(content).replace(/^```json\s*|```\s*$/gi, '').trim();
+    const parsed = JSON.parse(cleanedContent);
+    const sourceQuestions = Array.isArray(parsed?.questions)
+      ? parsed.questions
+      : Array.isArray(parsed)
+        ? parsed
+        : [];
+
+    if (!sourceQuestions.length) {
+      return mockAI.generateQuestions(topic, subject, difficulty, questionCount);
+    }
+
+    return sourceQuestions.slice(0, questionCount).map((question, index) => normalizeQuestion(question, index, subject || 'general', difficulty || 'medium'));
+  } catch (error) {
+    console.warn('OpenAI question generation failed, using fallback:', error.message || error);
+    return mockAI.generateQuestions(topic, subject, difficulty, questionCount);
+  }
+};
+
 // Generate questions from topic
 router.post('/generate-questions', authenticateToken, isAdmin, async (req, res) => {
   try {
@@ -152,19 +334,8 @@ router.post('/generate-questions', authenticateToken, isAdmin, async (req, res) 
       questionCount = 20;
     }
     
-    // Generate questions with timeout
-    const questions = await Promise.race([
-      new Promise((resolve) => {
-        setTimeout(() => {
-          resolve(mockAI.generateQuestions(topic, subject, difficulty, questionCount));
-        }, 100);
-      }),
-      new Promise((_, reject) => 
-        setTimeout(() => reject(new Error('Generation timeout')), 10000)
-      )
-    ]);
+    const questions = await generateQuestionsWithAI(topic, subject, difficulty, questionCount);
     
-    // Validate generated questions
     if (!questions || !Array.isArray(questions) || questions.length === 0) {
       throw new Error('No questions were generated');
     }
@@ -185,8 +356,6 @@ router.post('/generate-questions', authenticateToken, isAdmin, async (req, res) 
     
   } catch (error) {
     console.error('AI generation error:', error);
-    
-    // Send appropriate error response
     const statusCode = error.message === 'Generation timeout' ? 504 : 500;
     res.status(statusCode).json({ 
       success: false, 
@@ -200,46 +369,133 @@ router.post('/generate-questions', authenticateToken, isAdmin, async (req, res) 
 // Generate questions from text
 router.post('/extract-from-text', authenticateToken, isAdmin, async (req, res) => {
   try {
-    const { text, count = 5 } = req.body;
-    
+    const { text, count = 5, subject, difficulty } = req.body;
+
     if (!text || typeof text !== 'string') {
       return res.status(400).json({ success: false, error: 'Valid text is required' });
     }
-    
+
     if (text.length < 50) {
       return res.status(400).json({ success: false, error: 'Text should be at least 50 characters long' });
     }
-    
-    const sentences = text.split(/[.!?]+/).filter(s => s.trim().length > 20);
-    
-    if (sentences.length === 0) {
-      return res.status(400).json({ success: false, error: 'No valid sentences found in text' });
-    }
-    
-    let questionCount = Math.min(parseInt(count) || 5, sentences.length, 10);
-    const questions = [];
-    
-    for (let i = 0; i < questionCount; i++) {
-      questions.push({
-        id: `ai-text-${Date.now()}-${i}-${Math.random().toString(36).substr(2, 5)}`,
-        question: `Based on: "${sentences[i].substring(0, 100)}..." What is the main idea?`,
-        options: [
-          "The primary concept discussed",
-          "A supporting detail",
-          "An unrelated conclusion",
-          "A contradictory statement"
-        ],
-        correctAnswer: "The primary concept discussed",
-        layout: 'text-first',
-        questionImage: '',
-        explanation: "This can be customized based on the text content"
-      });
-    }
-    
+
+    const questions = await generateQuestionsFromTextSource(text, subject || 'general', difficulty || 'medium', count);
+
     res.json({ success: true, questions });
   } catch (error) {
     console.error('AI text extraction error:', error);
     res.status(500).json({ success: false, error: 'Failed to generate questions from text' });
+  }
+});
+
+router.post('/generate-from-pdf', authenticateToken, isAdmin, upload.single('file'), async (req, res) => {
+  try {
+    if (!req.file) {
+      return res.status(400).json({ success: false, error: 'PDF file is required' });
+    }
+
+    const fileName = String(req.file.originalname || 'document.pdf');
+    if (!fileName.toLowerCase().endsWith('.pdf')) {
+      return res.status(400).json({ success: false, error: 'Only PDF files are allowed for this endpoint' });
+    }
+
+    if (!pdfParse) {
+      return res.status(500).json({ success: false, error: 'PDF parsing library is not available' });
+    }
+
+    let pdfTextData;
+    try {
+      pdfTextData = await pdfParse(req.file.buffer);
+    } catch (pdfParseError) {
+      console.warn('Invalid PDF uploaded to AI generator:', pdfParseError.message || pdfParseError);
+      return res.status(400).json({
+        success: false,
+        error: 'This file is not a valid PDF or it is corrupted. Please upload a readable PDF file.'
+      });
+    }
+
+    const extractedText = String(pdfTextData?.text || '').trim();
+
+    if (!extractedText) {
+      return res.status(400).json({ success: false, error: 'No readable text found in the PDF' });
+    }
+
+    const parsePageSelection = (rawPageNumbers, maxPages) => {
+      const normalized = String(rawPageNumbers || '').trim();
+      if (!normalized) return [];
+
+      const selected = new Set();
+      normalized.split(',').forEach((token) => {
+        const part = token.trim();
+        if (!part) return;
+
+        const rangeMatch = part.match(/^(\d+)\s*-\s*(\d+)$/);
+        if (rangeMatch) {
+          const start = parseInt(rangeMatch[1], 10);
+          const end = parseInt(rangeMatch[2], 10);
+          if (Number.isNaN(start) || Number.isNaN(end)) return;
+          const from = Math.max(1, Math.min(start, end));
+          const to = Math.min(maxPages, Math.max(start, end));
+          for (let p = from; p <= to; p += 1) selected.add(p);
+          return;
+        }
+
+        const page = parseInt(part, 10);
+        if (!Number.isNaN(page) && page >= 1 && page <= maxPages) {
+          selected.add(page);
+        }
+      });
+
+      return Array.from(selected).sort((a, b) => a - b);
+    };
+
+    const { subject, difficulty, count, topic, pageNumbers } = req.body;
+    const totalPages = Number(pdfTextData?.numpages || 0);
+    const selectedPages = parsePageSelection(pageNumbers, totalPages || 1);
+
+    let selectedText = extractedText;
+    if (selectedPages.length > 0 && totalPages > 0) {
+      const pageChunks = extractedText.split(/\f+/).map((chunk) => chunk.trim()).filter(Boolean);
+      if (pageChunks.length === totalPages) {
+        selectedText = selectedPages
+          .map((pageNum) => pageChunks[pageNum - 1] || '')
+          .join('\n\n')
+          .trim();
+      }
+    }
+
+    const topicContext = String(topic || '').trim();
+    const pageContext = String(pageNumbers || '').trim();
+    const sourceTextForAI = [
+      topicContext ? `Requested topic: ${topicContext}` : '',
+      pageContext ? `Requested pages: ${pageContext}` : '',
+      selectedText
+    ].filter(Boolean).join('\n\n');
+
+    const questions = await generateQuestionsFromTextSource(
+      sourceTextForAI,
+      subject || 'general',
+      difficulty || 'medium',
+      count || 5
+    );
+
+    res.json({
+      success: true,
+      questions,
+      metadata: {
+        fileName,
+        extractedChars: selectedText.length,
+        topic: topicContext || null,
+        pageNumbers: pageContext || null,
+        selectedPages,
+        subject: subject || 'general',
+        difficulty: difficulty || 'medium',
+        count: questions.length
+      }
+    });
+  } catch (error) {
+    console.error('AI PDF generation error:', error);
+    res.status(500).json({ success: false, error: 'Failed to generate questions from PDF' });
   }
 });
 
@@ -291,11 +547,70 @@ router.post('/add-hint', authenticateToken, isAdmin, async (req, res) => {
       return res.status(400).json({ success: false, error: 'Question is required' });
     }
     
-    const hint = `💡 Hint: Review the key concepts related to this topic. Think about what makes the correct answer right.`;
+    const ai = getOpenAIClient();
+    let hint = `💡 Hint: Review the key concepts related to this topic. Think about what makes the correct answer right.`;
+
+    if (ai) {
+      try {
+        const response = await ai.chat.completions.create({
+          model: 'gpt-4o-mini',
+          messages: [{
+            role: 'user',
+            content: `Create a short educational hint for this multiple-choice question, without revealing the answer. Question: ${question}. Correct answer is: ${correctAnswer || 'not provided'}. Keep it to one sentence.`
+          }],
+          temperature: 0.5
+        });
+
+        const content = response?.choices?.[0]?.message?.content;
+        if (content) {
+          hint = content.trim();
+        }
+      } catch (openAiError) {
+        console.warn('OpenAI hint generation failed, using fallback hint.', openAiError.message || openAiError);
+      }
+    }
+
     res.json({ success: true, hint });
   } catch (error) {
     console.error('Add hint error:', error);
     res.status(500).json({ success: false, error: 'Failed to generate hint' });
+  }
+});
+
+router.post('/generate-hangman-hint', authenticateToken, isAdmin, async (req, res) => {
+  try {
+    const { word, category } = req.body;
+    if (!word || typeof word !== 'string' || !word.trim()) {
+      return res.status(400).json({ success: false, error: 'Word is required' });
+    }
+
+    const ai = getOpenAIClient();
+    let hint = mockAI.generateHangmanHint(word, category);
+
+    if (ai) {
+      try {
+        const response = await ai.chat.completions.create({
+          model: 'gpt-4o-mini',
+          messages: [{
+            role: 'user',
+            content: `Generate a very short, helpful hangman clue for the word "${word}" in the category "${category || 'general'}". The clue should not reveal the exact word; it should be a single sentence under 120 characters.`
+          }],
+          temperature: 0.6
+        });
+
+        const content = response?.choices?.[0]?.message?.content?.trim();
+        if (content) {
+          hint = content;
+        }
+      } catch (openAiError) {
+        console.warn('OpenAI hangman hint generation failed, using fallback:', openAiError.message || openAiError);
+      }
+    }
+
+    res.json({ success: true, hint });
+  } catch (error) {
+    console.error('Generate hangman hint error:', error);
+    res.status(500).json({ success: false, error: 'Failed to generate hangman hint' });
   }
 });
 
@@ -424,3 +739,8 @@ router.post('/extract-question', authenticateToken, isAdmin, async (req, res) =>
 });
 
 module.exports = router;
+module.exports.__test = {
+  getOpenAIClient,
+  generateQuestionsWithAI,
+  mockAI
+};
