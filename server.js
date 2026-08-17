@@ -1968,7 +1968,7 @@ app.get('/api/districts/quiz', authenticateToken, async (req, res) => {
 
     if (!error && dbQuestions && dbQuestions.length > 0) {
       districtQuestions = dbQuestions.map(q => ({
-        question: q.question,
+        question: String(q.question || '').toLowerCase(),
         correctAnswer: q.correct_answer,
         questionImage: q.image_url || null,
         category: q.category || null,
@@ -1976,16 +1976,16 @@ app.get('/api/districts/quiz', authenticateToken, async (req, res) => {
     } else {
       // Fallback hardcoded questions if table doesn't exist yet
       districtQuestions = [
-        { question: 'Which district is the capital city of Malawi located in?', correctAnswer: 'Lilongwe', category: 'capitals-major-towns' },
-        { question: 'Which district is home to Mount Mulanje, the highest peak in Malawi?', correctAnswer: 'Mulanje', category: 'physical-features' },
-        { question: 'Which district is the commercial capital of Malawi?', correctAnswer: 'Blantyre', category: 'capitals-major-towns' },
-        { question: 'Which district contains the southern tip of Lake Malawi?', correctAnswer: 'Mangochi', category: 'physical-features' },
-        { question: 'Which district is known for Liwonde National Park?', correctAnswer: 'Machinga', category: 'parks-wildlife' },
-        { question: 'Which district is in the far north of Malawi bordering Tanzania?', correctAnswer: 'Chitipa', category: 'borders-neighbors' },
-        { question: 'Which district is home to Zomba Plateau?', correctAnswer: 'Zomba', category: 'physical-features' },
-        { question: 'Which district is known for Kasungu National Park?', correctAnswer: 'Kasungu', category: 'parks-wildlife' },
-        { question: 'Which district is famous for tea estates in Malawi?', correctAnswer: 'Thyolo', category: 'economic-activities' },
-        { question: 'Which district was the old capital of Malawi before Lilongwe?', correctAnswer: 'Zomba', category: 'history-culture' },
+        { question: 'which district is the capital city of malawi located in?', correctAnswer: 'Lilongwe', category: 'capitals-major-towns' },
+        { question: 'which district is home to mount mulanje, the highest peak in malawi?', correctAnswer: 'Mulanje', category: 'physical-features' },
+        { question: 'which district is the commercial capital of malawi?', correctAnswer: 'Blantyre', category: 'capitals-major-towns' },
+        { question: 'which district contains the southern tip of lake malawi?', correctAnswer: 'Mangochi', category: 'physical-features' },
+        { question: 'which district is known for liwonde national park?', correctAnswer: 'Machinga', category: 'parks-wildlife' },
+        { question: 'which district is in the far north of malawi bordering tanzania?', correctAnswer: 'Chitipa', category: 'borders-neighbors' },
+        { question: 'which district is home to zomba plateau?', correctAnswer: 'Zomba', category: 'physical-features' },
+        { question: 'which district is known for kasungu national park?', correctAnswer: 'Kasungu', category: 'parks-wildlife' },
+        { question: 'which district is famous for tea estates in malawi?', correctAnswer: 'Thyolo', category: 'economic-activities' },
+        { question: 'which district was the old capital of malawi before lilongwe?', correctAnswer: 'Zomba', category: 'history-culture' },
       ];
     }
 
@@ -2021,7 +2021,7 @@ app.get('/api/districts/quiz', authenticateToken, async (req, res) => {
 
       return {
         id: `district-${idx}-${Date.now()}`,
-        question: q.question,
+        question: String(q.question || '').toLowerCase(),
         options,
         correctAnswer: q.correctAnswer,
         category: q.category || null,
@@ -2098,7 +2098,7 @@ app.post('/api/admin/district-questions', authenticateToken, requireAdmin, uploa
     const { data, error } = await supabase
       .from('district_questions')
       .insert({
-        question: question.trim(),
+        question: question.trim().toLowerCase(),
         correct_answer: correct_answer.trim(),
         category: normalizedCategory,
         image_url: imageUrl,
@@ -2125,7 +2125,7 @@ app.put('/api/admin/district-questions/:id', authenticateToken, requireAdmin, up
     const { question, correct_answer, category, is_active, remove_image } = req.body;
 
     const updateData = { updated_at: new Date().toISOString() };
-    if (question !== undefined) updateData.question = question.trim();
+    if (question !== undefined) updateData.question = question.trim().toLowerCase();
     if (correct_answer !== undefined) updateData.correct_answer = correct_answer.trim();
     if (category !== undefined) {
       const normalizedCategory = normalizeDistrictCategory(category);
@@ -2360,7 +2360,7 @@ function extractQuestionsFromText(text) {
         
         questions.push({
           id: `q-${Date.now()}-${questions.length}`,
-          question: currentQuestion,
+          question: currentQuestion.toLowerCase(),
           options: ensureFourOptions(currentOptions),
           correctAnswer: currentCorrectAnswer,
           layout: 'text-first'
@@ -2442,7 +2442,7 @@ function extractQuestionsFromText(text) {
     
     questions.push({
       id: `q-${Date.now()}-${questions.length}`,
-      question: currentQuestion,
+      question: currentQuestion.toLowerCase(),
       options: ensureFourOptions(currentOptions),
       correctAnswer: currentCorrectAnswer,
       layout: 'text-first'
@@ -4448,7 +4448,7 @@ app.post('/api/admin/extract-questions-advanced', authenticateToken, requireAdmi
           if (questionText && options.some(o => o)) {
             questions.push({
               id: `csv-${Date.now()}-${questions.length}`,
-              question: questionText,
+              question: questionText.toLowerCase(),
               options: ensureFourOptions(options),
               correctAnswer: correctAnswer || options[0] || '',
               layout: 'text-first',
@@ -4588,7 +4588,7 @@ Return ONLY a valid JSON array with the same structure:
               if (formatted[i]) {
                 allFormatted.push({
                   ...batch[i],
-                  question: formatted[i].question || batch[i].question,
+                  question: String(formatted[i].question || batch[i].question || '').toLowerCase(),
                   options: formatted[i].options || batch[i].options,
                   correctAnswer: formatted[i].correctAnswer || batch[i].correctAnswer,
                 });
@@ -4768,7 +4768,7 @@ app.post('/api/admin/question-bank', authenticateToken, requireAdmin, async (req
       subject_id: subject_id,
       difficulty_level: difficulty_level,
       class_level: class_level,
-      question: question.trim(),
+      question: question.trim().toLowerCase(),
       options: JSON.stringify(options),
       correct_answer: correct_answer,
       explanation: explanation || null,
@@ -4826,7 +4826,7 @@ app.post('/api/admin/question-bank/bulk-import', authenticateToken, requireAdmin
           subject_id: subject_id,
           difficulty_level: difficulty_level,
           class_level: class_level,
-          question: q.question.trim(),
+          question: q.question.trim().toLowerCase(),
           options: JSON.stringify(q.options),
           correct_answer: q.correctAnswer,
           explanation: q.explanation || null,
